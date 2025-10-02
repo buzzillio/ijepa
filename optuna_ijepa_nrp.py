@@ -118,11 +118,11 @@ def objective(trial: optuna.trial.Trial) -> float:
         "--nr-idf-power", str(nr_idf_power),
         "--nr-weight-power", str(nr_weight_power),
         "--nr-idf-smooth", str(nr_idf_smooth),
-        # Evaluation
+        # Evaluation (larger sets + 3 seeds for maximum stability)
         "--eval", "knn",
-        "--eval-train", "1000",
-        "--eval-val", "1000",
-        "--eval-seed", "123",  # Fixed seed for reproducible k-NN sampling
+        "--eval-train", "9000",  # Use almost full train set for stable k-NN bank
+        "--eval-val", "3900",    # Use full validation set
+        "--eval-seeds", "123", "456", "789",  # Average over 3 seeds for stable results
         # Don't save models during HPO to save disk space
         "--save-dir", f"/tmp/ijepa_trial_{trial.number}",
     ]
@@ -140,11 +140,11 @@ def objective(trial: optuna.trial.Trial) -> float:
     
     print(f"\n{'='*80}")
     print(f"Trial {trial.number} completed:")
-    print(f"  Eval seed: 123 (fixed for reproducibility)")
+    print(f"  Eval seeds: [123, 456, 789] (averaged for stability)")
     print(f"  Threshold: {nr_activation_threshold}")
     print(f"  TF power: {nr_tf_power}, IDF power: {nr_idf_power}")
     print(f"  Weight power: {nr_weight_power}, IDF smooth: {nr_idf_smooth}")
-    print(f"  → NRP Accuracy: {accuracy:.2f}%")
+    print(f"  → NRP Accuracy (avg): {accuracy:.2f}%")
     print(f"{'='*80}\n")
     
     return accuracy
@@ -253,8 +253,8 @@ python ijepa_prune_neuronrank.py \\
   --nr-idf-power {best_attrs.get('nr_idf_power', 1.0)} \\
   --nr-weight-power {best_attrs.get('nr_weight_power', 1.0)} \\
   --nr-idf-smooth {best_attrs.get('nr_idf_smooth', 1.0)} \\
-  --eval knn --eval-train 1000 --eval-val 1000 \\
-  --eval-seed 123 \\
+  --eval knn --eval-train 9000 --eval-val 3900 \\
+  --eval-seeds 123 456 789 \\
   --compare-mb \\
   --save-dir ./ijepa_best_nr
 """)

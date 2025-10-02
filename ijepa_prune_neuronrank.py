@@ -857,6 +857,7 @@ def main():
     p.add_argument("--save-dir", type=str, default="./ijepa_pruned")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--eval-seed", type=int, default=123, help="Random seed for k-NN evaluation sampling (for reproducibility)")
+    p.add_argument("--eval-seeds", type=int, nargs='+', default=None, help="Multiple eval seeds to average over for stable results (e.g., --eval-seeds 123 456 789)")
     # Processor speed control
     p.add_argument("--use-fast-processor", dest="use_fast_processor", action="store_true", help="Use fast image processor if available (default)")
     p.add_argument("--no-fast-processor", dest="use_fast_processor", action="store_false", help="Force slow image processor")
@@ -904,9 +905,24 @@ def main():
             eval_root = auto_download_imagenette()
         else:
             eval_root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
-        print(f"Running baseline k-NN (local ImageFolder at {eval_root})…")
-        acc_base = knn_probe_local(model, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
-        print(f"Baseline k-NN@20: top-1 = {acc_base*100:.2f}%\n")
+        
+        # Use multiple eval seeds if specified for stability
+        eval_seeds = args.eval_seeds if args.eval_seeds else [args.eval_seed]
+        
+        if len(eval_seeds) > 1:
+            print(f"Running baseline k-NN (local ImageFolder at {eval_root}) with {len(eval_seeds)} seeds for stability…")
+            accs = []
+            for seed in eval_seeds:
+                acc = knn_probe_local(model, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=seed)
+                accs.append(acc)
+                print(f"  Seed {seed}: {acc*100:.2f}%")
+            acc_base = sum(accs) / len(accs)
+            std_base = (sum((a - acc_base)**2 for a in accs) / len(accs)) ** 0.5
+            print(f"Baseline k-NN@20: top-1 = {acc_base*100:.2f}% ± {std_base*100:.2f}%\n")
+        else:
+            print(f"Running baseline k-NN (local ImageFolder at {eval_root})…")
+            acc_base = knn_probe_local(model, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=eval_seeds[0])
+            print(f"Baseline k-NN@20: top-1 = {acc_base*100:.2f}%\n")
 
     # === Unstructured path ===
     if args.mode == "unstructured":
