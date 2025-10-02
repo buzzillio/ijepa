@@ -116,6 +116,7 @@ def objective(trial: optuna.trial.Trial) -> float:
         "--eval", "knn",
         "--eval-train", "1000",
         "--eval-val", "1000",
+        "--eval-seed", "123",  # Fixed seed for reproducible k-NN sampling
         # Don't save models during HPO to save disk space
         "--save-dir", f"/tmp/ijepa_trial_{trial.number}",
     ]
@@ -133,6 +134,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     
     print(f"\n{'='*80}")
     print(f"Trial {trial.number} completed:")
+    print(f"  Eval seed: 123 (fixed for reproducibility)")
     print(f"  Threshold: {nr_activation_threshold}")
     print(f"  TF power: {nr_tf_power}, IDF power: {nr_idf_power}")
     print(f"  Weight power: {nr_weight_power}, IDF smooth: {nr_idf_smooth}")
@@ -232,7 +234,8 @@ python ijepa_prune_neuronrank.py \\
   --nr-idf-power {best_attrs.get('nr_idf_power', 1.0)} \\
   --nr-weight-power {best_attrs.get('nr_weight_power', 1.0)} \\
   --nr-idf-smooth {best_attrs.get('nr_idf_smooth', 1.0)} \\
-  --eval knn --eval-train 1000 --eval-val 500 \\
+  --eval knn --eval-train 1000 --eval-val 1000 \\
+  --eval-seed 123 \\
   --compare-mb \\
   --save-dir ./ijepa_best_nr
 """)

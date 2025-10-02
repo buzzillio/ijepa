@@ -639,6 +639,7 @@ def knn_probe_local(
     val_n: int = 1000,
     k: int = 20,
     device: str = "cuda",
+    eval_seed: int = 123,
 ) -> float:
     model.eval().to(device)
     root = os.path.expanduser(root)
@@ -662,8 +663,15 @@ def knn_probe_local(
 
     train_items = list_images_with_labels(train_dir)
     val_items = list_images_with_labels(val_dir)
-    random.shuffle(train_items)
-    random.shuffle(val_items)
+    
+    # Sort for deterministic ordering across different filesystems
+    train_items = sorted(train_items, key=lambda x: str(x[0]))
+    val_items = sorted(val_items, key=lambda x: str(x[0]))
+    
+    # Use dedicated RNG with eval_seed for reproducibility
+    eval_rng = random.Random(eval_seed)
+    eval_rng.shuffle(train_items)
+    eval_rng.shuffle(val_items)
     train_items = train_items[: max(1, min(train_n, len(train_items)))]
     val_items = val_items[: max(1, min(val_n, len(val_items)))]
 
@@ -848,6 +856,7 @@ def main():
     p.add_argument("--eval-val", type=int, default=1000)
     p.add_argument("--save-dir", type=str, default="./ijepa_pruned")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--eval-seed", type=int, default=123, help="Random seed for k-NN evaluation sampling (for reproducibility)")
     # Processor speed control
     p.add_argument("--use-fast-processor", dest="use_fast_processor", action="store_true", help="Use fast image processor if available (default)")
     p.add_argument("--no-fast-processor", dest="use_fast_processor", action="store_false", help="Force slow image processor")
@@ -859,10 +868,17 @@ def main():
     p.add_argument("--remove-reparam", action="store_true", help="Call prune.remove() to make zeros permanent on weights")
 
     args = p.parse_args()
+    
+    # Print configuration at the very start
+    print("="*80)
+    print(f"Device: {args.device}")
+    print(f"Model seed: {args.seed}")
+    print(f"Eval seed: {args.eval_seed}")
+    print("="*80)
+    
     seed_all(args.seed)
 
-    print(f"Device: {args.device}")
-    print(f"Loading model: {args.model_id}")
+    print(f"\nLoading model: {args.model_id}")
     # Prefer fast processor to avoid slow-processor warning, with safe fallback
     try:
         processor = AutoProcessor.from_pretrained(args.model_id, use_fast=args.use_fast_processor)
@@ -889,7 +905,7 @@ def main():
         else:
             eval_root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
         print(f"Running baseline k-NN (local ImageFolder at {eval_root})…")
-        acc_base = knn_probe_local(model, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device)
+        acc_base = knn_probe_local(model, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
         print(f"Baseline k-NN@20: top-1 = {acc_base*100:.2f}%\n")
 
     # === Unstructured path ===
@@ -966,7 +982,7 @@ def main():
                     eval_root = auto_download_imagenette()
                 else:
                     eval_root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
-                acc_un_nrp = knn_probe_local(model_nrp, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device)
+                acc_un_nrp = knn_probe_local(model_nrp, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
                 print(f"[Unstructured-NRP] k-NN@20: top-1 = {acc_un_nrp*100:.2f}%  |  Δ vs base = {(acc_un_nrp - (acc_base or acc_un_nrp)) * 100:.2f}%")
             # Save
             out_dir_nrp = args.save_dir.rstrip("/") + "_unstr_nrp"
@@ -989,7 +1005,7 @@ def main():
                     eval_root = auto_download_imagenette()
                 else:
                     eval_root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
-                acc_un_mb = knn_probe_local(model_mb, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device)
+                acc_un_mb = knn_probe_local(model_mb, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
                 print(f"[Unstructured-MB]  k-NN@20: top-1 = {acc_un_mb*100:.2f}%  |  Δ vs base = {(acc_un_mb - (acc_base or acc_un_mb)) * 100:.2f}%")
             # Save
             out_dir_mb = args.save_dir.rstrip("/") + "_unstr_mb"
@@ -1091,7 +1107,7 @@ def main():
         else:
             eval_root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
         print(f"Evaluating NRP model with k-NN (local ImageFolder at {eval_root})…")
-        acc_nrp = knn_probe_local(model, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device)
+        acc_nrp = knn_probe_local(model, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
         print(f"NRP k-NN@20: top-1 = {acc_nrp*100:.2f}%  |  Δ vs base = {(acc_nrp - (acc_base or acc_nrp)) * 100:.2f}%\n")
 
     # Optional magnitude-based comparison
@@ -1115,7 +1131,7 @@ def main():
                 eval_root = auto_download_imagenette()
             else:
                 eval_root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
-            acc_mb = knn_probe_local(model_mb, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device)
+            acc_mb = knn_probe_local(model_mb, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
             print(f"MBP k-NN@20: top-1 = {acc_mb*100:.2f}%  |  Δ vs base = {(acc_mb - (acc_base or acc_mb)) * 100:.2f}%")
         # Save MBP too
         mb_dir = args.save_dir.rstrip("/") + "_mbp"
