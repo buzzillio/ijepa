@@ -44,6 +44,12 @@ def run_pruning_script(args_list: list) -> float:
         )
         output = proc.stdout + "\n" + proc.stderr
         
+        # Extract and print device info from output
+        import re
+        device_match = re.search(r"Device:\s*(\w+)", output)
+        if device_match:
+            print(f"    → Using device: {device_match.group(1).upper()}")
+        
         # Check for errors first
         if proc.returncode != 0:
             print(f"=== TRIAL FAILED: Script exited with code {proc.returncode} ===")
@@ -145,6 +151,19 @@ def objective(trial: optuna.trial.Trial) -> float:
 
 
 def main():
+    # Print device info at startup
+    import torch
+    if torch.cuda.is_available():
+        detected_device = "CUDA"
+        print(f"\n🚀 GPU detected: {torch.cuda.get_device_name(0)}")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        detected_device = "MPS"
+        print(f"\n🚀 MPS (Apple Silicon GPU) detected")
+    else:
+        detected_device = "CPU"
+        print(f"\n⚠️  No GPU detected, using CPU")
+    print(f"Default device for trials: {detected_device}\n")
+    
     # Configure Optuna
     sampler = TPESampler(
         seed=42,
