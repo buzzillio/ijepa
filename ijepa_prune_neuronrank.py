@@ -1191,7 +1191,13 @@ def collect_activation_stats_for_fc1_modules(
     
     # Load local images
     model.eval().to(device)
-    root = os.path.expanduser(dataset_name)
+    
+    # Auto-download if "imagenette" keyword is used
+    if dataset_name == "imagenette":
+        root = auto_download_imagenette()
+    else:
+        root = os.path.expanduser(dataset_name)
+    
     train_dir = os.path.join(root, "train") if os.path.isdir(os.path.join(root, "train")) else root
     paths: List[Path] = []
     for p in Path(train_dir).rglob("*"):

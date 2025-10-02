@@ -29,20 +29,34 @@ def run_pruning_script(args_list: list) -> float:
     # Use current Python interpreter (works if you're already in a venv)
     cmd = [sys.executable, script_path] + args_list
     
+    # Fix MKL threading issue
+    env = os.environ.copy()
+    env['MKL_THREADING_LAYER'] = 'GNU'
+    env['MKL_SERVICE_FORCE_INTEL'] = '1'
+    
     try:
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=600,  # 10 min timeout per trial
+            env=env,
         )
         output = proc.stdout + "\n" + proc.stderr
+        
+        # Check for errors first
+        if proc.returncode != 0:
+            print(f"=== TRIAL FAILED: Script exited with code {proc.returncode} ===")
+            print("STDOUT:")
+            print(output[-3000:])  # Print last 3000 chars for debugging
+            raise RuntimeError(f"Script failed with exit code {proc.returncode}")
         
         # Extract NRP accuracy
         match = NRP_REGEX.search(output)
         if not match:
             print("=== TRIAL FAILED: No NRP metric found ===")
-            print(output[-2000:])  # Print last 2000 chars for debugging
+            print("FULL OUTPUT:")
+            print(output[-3000:])  # Print last 3000 chars for debugging
             raise RuntimeError("NRP metric not found in output")
         
         accuracy = float(match.group(1))
@@ -51,6 +65,9 @@ def run_pruning_script(args_list: list) -> float:
     except subprocess.TimeoutExpired:
         print("=== TRIAL TIMED OUT ===")
         raise RuntimeError("Trial exceeded timeout")
+    except RuntimeError:
+        # Re-raise RuntimeError (from our checks above)
+        raise
     except Exception as e:
         print(f"=== TRIAL ERROR: {e} ===")
         raise
