@@ -222,7 +222,12 @@ def auto_download_imagenette(dataset_dir: str = "~/Datasets") -> str:
     print(f"Extracting {tgz_path}...")
     try:
         with tarfile.open(tgz_path, "r:gz") as tar:
-            tar.extractall(path=dataset_dir)
+            # Use filter for Python 3.14+ compatibility
+            try:
+                tar.extractall(path=dataset_dir, filter='data')
+            except TypeError:
+                # Older Python versions don't support filter parameter
+                tar.extractall(path=dataset_dir)
         print(f"✓ Extracted to: {target_path}")
     except Exception as e:
         raise RuntimeError(f"Failed to extract Imagenette2-320: {e}")
@@ -856,6 +861,7 @@ def main():
     args = p.parse_args()
     seed_all(args.seed)
 
+    print(f"Device: {args.device}")
     print(f"Loading model: {args.model_id}")
     # Prefer fast processor to avoid slow-processor warning, with safe fallback
     try:
@@ -957,10 +963,10 @@ def main():
             print(f"[Unstructured-NRP] Applied {args.prune_ratio:.2f} ({args.unstructured_scope}) → sparsity {spars:.2f}% over fc1 weights")
             if args.eval != "none":
                 if args.calib_ds == "imagenette":
-                    acc_un_nrp = knn_probe(model_nrp, processor, train_n=args.eval_train, val_n=args.eval_val, device=args.device)
+                    eval_root = auto_download_imagenette()
                 else:
-                    root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
-                    acc_un_nrp = knn_probe_local(model_nrp, processor, root=root, train_n=args.eval_train, val_n=args.eval_val, device=args.device)
+                    eval_root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
+                acc_un_nrp = knn_probe_local(model_nrp, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device)
                 print(f"[Unstructured-NRP] k-NN@20: top-1 = {acc_un_nrp*100:.2f}%  |  Δ vs base = {(acc_un_nrp - (acc_base or acc_un_nrp)) * 100:.2f}%")
             # Save
             out_dir_nrp = args.save_dir.rstrip("/") + "_unstr_nrp"
@@ -980,10 +986,10 @@ def main():
             print(f"[Unstructured-MB] Applied {args.prune_ratio:.2f} ({args.unstructured_scope}) → sparsity {spars_mb:.2f}% over fc1 weights")
             if args.eval != "none":
                 if args.calib_ds == "imagenette":
-                    acc_un_mb = knn_probe(model_mb, processor, train_n=args.eval_train, val_n=args.eval_val, device=args.device)
+                    eval_root = auto_download_imagenette()
                 else:
-                    root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
-                    acc_un_mb = knn_probe_local(model_mb, processor, root=root, train_n=args.eval_train, val_n=args.eval_val, device=args.device)
+                    eval_root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
+                acc_un_mb = knn_probe_local(model_mb, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device)
                 print(f"[Unstructured-MB]  k-NN@20: top-1 = {acc_un_mb*100:.2f}%  |  Δ vs base = {(acc_un_mb - (acc_base or acc_un_mb)) * 100:.2f}%")
             # Save
             out_dir_mb = args.save_dir.rstrip("/") + "_unstr_mb"
@@ -1081,12 +1087,11 @@ def main():
     acc_nrp = None
     if args.eval != "none":
         if args.calib_ds == "imagenette":
-            print("Evaluating NRP model with k-NN (HF Imagenette)…")
-            acc_nrp = knn_probe(model, processor, train_n=args.eval_train, val_n=args.eval_val, device=args.device)
+            eval_root = auto_download_imagenette()
         else:
-            root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
-            print(f"Evaluating NRP model with k-NN (local ImageFolder at {root})…")
-            acc_nrp = knn_probe_local(model, processor, root=root, train_n=args.eval_train, val_n=args.eval_val, device=args.device)
+            eval_root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
+        print(f"Evaluating NRP model with k-NN (local ImageFolder at {eval_root})…")
+        acc_nrp = knn_probe_local(model, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device)
         print(f"NRP k-NN@20: top-1 = {acc_nrp*100:.2f}%  |  Δ vs base = {(acc_nrp - (acc_base or acc_nrp)) * 100:.2f}%\n")
 
     # Optional magnitude-based comparison
@@ -1107,10 +1112,10 @@ def main():
         )
         if args.eval != "none":
             if args.calib_ds == "imagenette":
-                acc_mb = knn_probe(model_mb, processor, train_n=args.eval_train, val_n=args.eval_val, device=args.device)
+                eval_root = auto_download_imagenette()
             else:
-                root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
-                acc_mb = knn_probe_local(model_mb, processor, root=root, train_n=args.eval_train, val_n=args.eval_val, device=args.device)
+                eval_root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
+            acc_mb = knn_probe_local(model_mb, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device)
             print(f"MBP k-NN@20: top-1 = {acc_mb*100:.2f}%  |  Δ vs base = {(acc_mb - (acc_base or acc_mb)) * 100:.2f}%")
         # Save MBP too
         mb_dir = args.save_dir.rstrip("/") + "_mbp"
