@@ -1,0 +1,25 @@
+# Requirements for ijepa_prune_neuronrank.py and optuna_ijepa_nrp.py
+# 
+# Install with: pip install -r requirements_ijepa_nrp.txt
+
+# Core deep learning
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Transformers and datasets
+transformers>=4.56.0
+datasets>=2.14.0
+
+# Image processing
+pillow>=10.0.0
+
+# Pruning
+torch-pruning>=1.2.0
+
+# Hyperparameter optimization (for optuna_ijepa_nrp.py)
+optuna>=3.0.0
+
+# Optional but recommended
+tqdm>=4.65.0
+numpy>=1.24.0
+
