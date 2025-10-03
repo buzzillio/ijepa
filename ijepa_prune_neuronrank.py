@@ -100,6 +100,13 @@ def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
+def estimate_model_size_gb(model: nn.Module) -> float:
+    """Estimate model size in GB (assumes float32)."""
+    param_size = sum(p.numel() * p.element_size() for p in model.parameters())
+    buffer_size = sum(b.numel() * b.element_size() for b in model.buffers())
+    return (param_size + buffer_size) / (1024**3)
+
+
 def count_target_mlp_params(target_mlps: List) -> int:
     """Count parameters in target MLP layers (fc1 + fc2)."""
     total = 0
@@ -423,12 +430,13 @@ def compute_variance_magnitude_scores(
     target_mlps: List[MLPHandle],
     activation_stats: Dict[str, Dict],
     discrimination_weight: float = 1.0,
+    beta: float = 1.0,
 ) -> Dict[int, torch.Tensor]:
     """
     Computes a hybrid score for each channel by combining class-discriminative
     variance with the magnitude (L2 norm) of its corresponding weights.
     
-    Score = Variance(per-class means) * L2_Norm(outgoing_weights)
+    Score = (Variance^discrimination_weight) * (beta × ||W||₂)
     
     This rewards channels that are both selective and have large weights.
     
@@ -477,6 +485,87 @@ def compute_variance_magnitude_scores(
         # Apply discrimination weight: Score = (Variance^weight) * Magnitude
         if discrimination_weight != 1.0:
             variance_score = variance_score.pow(discrimination_weight)
+        
+        # Apply beta multiplier to magnitude score
+        if beta != 1.0:
+            magnitude_score = magnitude_score * beta
+            
+        # Final Score = Weighted Discrimination * Impact
+        channel_scores = variance_score * magnitude_score
+        
+        score_map[h.idx] = channel_scores
+
+    return score_map
+
+
+@torch.no_grad()
+def compute_variance_magnitude_scores_fc2(
+    target_mlps: List[MLPHandle],
+    activation_stats: Dict[str, Dict],
+    discrimination_weight: float = 1.0,
+    beta: float = 1.0,
+) -> Dict[int, torch.Tensor]:
+    """
+    Computes a hybrid score for each channel by combining class-discriminative
+    variance with the magnitude (L2 norm) of its OUTGOING weights in fc2.
+    
+    Score = (Variance^discrimination_weight) * (beta × ||W_fc2||₂)
+    
+    This variant uses the fc2 weights (downstream impact) instead of fc1 weights.
+    For each intermediate channel j, we take the L2 norm of column j in fc2.weight,
+    which represents how strongly that channel influences the next layer.
+    
+    Returns {block_idx: scores[out_channels]} for structured pruning.
+    """
+    score_map: Dict[int, torch.Tensor] = {}
+
+    for h in target_mlps:
+        name = h.name + ".intermediate.dense" if h.name.startswith("encoder.layer") else h.name + ".fc1"
+        stats = activation_stats.get(name)
+
+        if not stats or not stats.get('per_class'):
+            print(f"[warn] No per-class stats for {name}, cannot compute score. Skipping.")
+            continue
+
+        per_class_stats = stats['per_class']
+        class_means = [
+            s['mean_abs_activation']
+            for s in per_class_stats.values()
+            if s.get('sample_count', 0) > 0 and 'mean_abs_activation' in s
+        ]
+
+        if not class_means:
+            num_channels = h.fc1.out_features
+            score_map[h.idx] = torch.zeros(num_channels)
+            continue
+            
+        class_means_tensor = torch.stack(class_means, dim=0)
+
+        # 1. Discrimination Score: Variance across classes (same as original)
+        variance_score = torch.var(class_means_tensor, dim=0, unbiased=False)
+        
+        # 2. Impact Score: L2 norm of fc2 COLUMN weights (downstream impact)
+        # fc2.weight shape: [out_features, intermediate_channels]
+        # We want the norm of each column (dimension 0), representing the outgoing impact
+        weights_fc2 = h.fc2.weight.detach().to(dtype=torch.float32, device='cpu')
+        magnitude_score = torch.norm(weights_fc2, p=2, dim=0)  # Note: dim=0 for columns
+        
+        # Normalize both scores to [0, 1] to ensure fair contribution
+        var_min, var_max = variance_score.min(), variance_score.max()
+        if var_max > var_min:
+            variance_score = (variance_score - var_min) / (var_max - var_min)
+
+        mag_min, mag_max = magnitude_score.min(), magnitude_score.max()
+        if mag_max > mag_min:
+            magnitude_score = (magnitude_score - mag_min) / (mag_max - mag_min)
+            
+        # Apply discrimination weight: Score = (Variance^weight) * Magnitude
+        if discrimination_weight != 1.0:
+            variance_score = variance_score.pow(discrimination_weight)
+        
+        # Apply beta multiplier to magnitude score
+        if beta != 1.0:
+            magnitude_score = magnitude_score * beta
             
         # Final Score = Weighted Discrimination * Impact
         channel_scores = variance_score * magnitude_score
@@ -899,6 +988,10 @@ def collect_neuronrank_scores(
 # ------------------------------
 # Structural pruning (fc1 out / fc2 in)
 # ------------------------------
+
+# ------------------------------
+# Structural pruning (fc1 out / fc2 in) — explicit pairing via Torch-Pruning
+# ------------------------------
 class IJepaWrapper(nn.Module):
     def __init__(self, model: nn.Module):
         super().__init__()
@@ -916,31 +1009,314 @@ def apply_structured_mlp_pruning(
     prune_ratio: float,
     device: str = "cuda",
 ):
-    # Prepare a wrapper and dependency graph with a dummy image
+    """Prune the same intermediate channel across fc1 (out) and fc2 (in) for every
+    target MLP block, using Torch-Pruning's DependencyGraph groups.
+
+    For each block b with score vector s_b (length = hidden/intermediate size),
+    we select the lowest `prune_ratio` fraction of indices and create a pruning
+    group anchored at fc1 (prune_linear_out_channels), then explicitly **add**
+    the paired fc2 in-channels (prune_linear_in_channels) to the same group.
+
+    This makes the coupling explicit and robust to non-trivial graphs, matching
+    Torch-Pruning's recommended usage (DepGraph + group.add_pruning_target).
+    """
+    # Wrap model to create a stable forward for DG tracing
     wrapper = IJepaWrapper(model)
     wrapper.eval().to(device)
 
-    # Create a dummy example input matching processor's expected size
-    size = model.config.image_size
+    # Create a dummy example input with the processor's expected size
+    size = getattr(model.config, "image_size", 224)
     dummy = torch.zeros(1, 3, size, size, device=device)
 
+    # Torch-Pruning's documented pattern is:
+    #   group = DG.get_pruning_group(...); group.prune()
+    # and it auto-infers coupled layers (no add_* API on Group). See https://github.com/VainF/Torch-Pruning/wiki/Structured-Pruning-of-Transformers
     DG = tp.DependencyGraph().build_dependency(wrapper, example_inputs=(dummy,))
 
     total_pruned = 0
     for h in target_mlps:
-        sc = scores[h.idx]
+        sc = scores.get(h.idx)
+        if sc is None:
+            print(f"[warn] No scores for block {h.idx}; skipping.")
+            continue
         hidden = sc.numel()
         k = int(round(prune_ratio * hidden))
         if k <= 0:
             continue
-        # prune the lowest-scoring channels
+        # lowest-score indices to remove
         idxs = torch.argsort(sc)[:k].tolist()
-        group = DG.get_pruning_group(h.fc1, tp.prune_linear_out_channels, idxs=idxs)
+
+        # Build a pruning group anchored at fc1 out-channels
+        try:
+            group = DG.get_pruning_group(h.fc1, tp.prune_linear_out_channels, idxs=idxs)
+        except Exception as e:
+            print(f"[warn] Failed to create pruning group for block {h.idx}: {e}")
+            continue
+
         if DG.check_pruning_group(group):
             group.prune()
             total_pruned += len(idxs)
         else:
-            print(f"[warn] Skipped block {h.idx}: pruning group invalid")
+            print(f"[warn] Skipped block {h.idx}: invalid pruning group (dependency check failed)")
+# ------------------------------
+# Attention head pruning support
+# ------------------------------
+
+# --- Attention handle dataclass and finder ---
+from dataclasses import dataclass
+import re
+
+@dataclass
+class AttnHandle:
+    name: str
+    attn_mod: nn.Module  # e.g., encoder.layer.X.attention.attention
+    query: nn.Linear
+    key: nn.Linear
+    value: nn.Linear
+    out: nn.Linear       # encoder.layer.X.attention.output.dense
+    idx: int             # block index
+    num_heads: int
+    head_dim: int
+
+def find_attention_modules(model: nn.Module) -> List[AttnHandle]:
+    """Discover attention (Q,K,V + output.dense) modules per encoder block (ViT/I-JEPA style)."""
+    name_to_mod: Dict[str, nn.Module] = dict(model.named_modules())
+    attns: List[AttnHandle] = []
+    idx = 0
+    # Scan encoder.layer.N.attention
+    for n, m in list(name_to_mod.items()):
+        if not n.endswith(".attention"):
+            continue
+        # attention container has `.attention` (qkv) and `.output.dense`
+        attn_inner = name_to_mod.get(n + ".attention")
+        out_mod = name_to_mod.get(n + ".output")
+        if attn_inner is None or out_mod is None:
+            continue
+        q = getattr(attn_inner, "query", None)
+        k = getattr(attn_inner, "key", None)
+        v = getattr(attn_inner, "value", None)
+        o = getattr(out_mod, "dense", None)
+        if not (isinstance(q, nn.Linear) and isinstance(k, nn.Linear) and isinstance(v, nn.Linear) and isinstance(o, nn.Linear)):
+            continue
+        # Resolve heads and head_dim from config and current layer widths
+        all_size = q.out_features
+        num_heads = getattr(getattr(getattr(model, "config", object()), "num_attention_heads", None), None)  # dummy to ensure getattr chain
+        # Fallback: derive from module if model.config not accessible here
+        num_heads = getattr(getattr(attn_inner, "num_attention_heads", None), "__int__", lambda: None)() or getattr(model.config, "num_attention_heads", None)
+        if num_heads is None or num_heads <= 0:
+            # try to infer by dividing out_features by known head size from module
+            head_size = getattr(attn_inner, "attention_head_size", None) or (all_size // max(1, getattr(model.config, "num_attention_heads", 1)))
+            num_heads = max(1, all_size // max(1, head_size))
+        head_dim = all_size // num_heads
+        # Determine block index from name (encoder.layer.N)
+        mobj = re.search(r"encoder\.layer\.(\d+)", n)
+        bidx = int(mobj.group(1)) if mobj else idx
+        attns.append(AttnHandle(name=n + ".attention", attn_mod=attn_inner, query=q, key=k, value=v, out=o, idx=bidx, num_heads=num_heads, head_dim=head_dim))
+        idx += 1
+    return attns
+
+# --- Head-activation scoring collector ---
+@torch.no_grad()
+def collect_head_activation_scores(
+    model: nn.Module,
+    processor: AutoProcessor,
+    dataset_name: str,
+    num_images: int,
+    target_attn: List[AttnHandle],
+    batch_size: int = 16,
+    device: str = "cuda",
+    mode: str = "act_l1",
+) -> Dict[int, torch.Tensor]:
+    """Compute per-head scores by hooking Q/K/V outputs and averaging |.| (or L2) per head across tokens.
+    Returns {block_idx: scores[num_heads]}.
+    """
+    # Storage per block: accumulators for Q,K,V per head
+    acc_q: Dict[int, torch.Tensor] = {}
+    acc_k: Dict[int, torch.Tensor] = {}
+    acc_v: Dict[int, torch.Tensor] = {}
+    cnt: Dict[int, int] = {}
+
+    handles: List[RemovableHandle] = []
+
+    def make_hook(bidx: int, which: str, head_dim: int, num_heads: int):
+        def hook(_m, _inp, out):
+            # out: [B, T, hidden] or [B, hidden]
+            if out.dim() == 2:
+                # assume [B, hidden] → add T=1
+                out_ = out.unsqueeze(1)
+            else:
+                out_ = out
+            B, T, H = out_.shape
+            # reshape to heads
+            x = out_.reshape(B*T, num_heads, head_dim)  # [BT, H, D]
+            if mode == "act_l2":
+                head_stat = x.pow(2).mean(dim=(0, 2))  # [H]
+            else:
+                head_stat = x.abs().mean(dim=(0, 2))   # [H]
+            if which == "q":
+                acc = acc_q
+            elif which == "k":
+                acc = acc_k
+            else:
+                acc = acc_v
+            if bidx not in acc:
+                acc[bidx] = head_stat.detach().cpu()
+            else:
+                acc[bidx] += head_stat.detach().cpu()
+            cnt[bidx] = cnt.get(bidx, 0) + 1
+        return hook
+
+    for ah in target_attn:
+        handles.append(ah.query.register_forward_hook(make_hook(ah.idx, "q", ah.head_dim, ah.num_heads)))
+        handles.append(ah.key.register_forward_hook(make_hook(ah.idx, "k", ah.head_dim, ah.num_heads)))
+        handles.append(ah.value.register_forward_hook(make_hook(ah.idx, "v", ah.head_dim, ah.num_heads)))
+
+    # Load a small local dataset (reusing existing loader logic)
+    if dataset_name == "imagenette":
+        root = auto_download_imagenette()
+    else:
+        root = os.path.expanduser(dataset_name)
+    train_dir = os.path.join(root, "train") if os.path.isdir(os.path.join(root, "train")) else root
+    paths: List[Path] = []
+    for p in Path(train_dir).rglob("*"):
+        if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp", ".webp"):
+            paths.append(p)
+    if not paths:
+        raise RuntimeError(f"No images found under: {train_dir}")
+    random.shuffle(paths)
+    paths = paths[: max(1, min(num_images, len(paths)))]
+
+    model.eval().to(device)
+    for i in range(0, len(paths), batch_size):
+        batch_paths = paths[i : i + batch_size]
+        imgs = [Image.open(p).convert("RGB") for p in batch_paths]
+        inputs = processor(images=imgs, return_tensors="pt").to(device)
+        _ = model(**inputs)
+        for im in imgs:
+            try: im.close()
+            except Exception: pass
+
+    for h in handles:
+        h.remove()
+
+    # Combine Q/K/V stats → simple average
+    scores: Dict[int, torch.Tensor] = {}
+    for bidx in sorted(cnt.keys()):
+        q = acc_q.get(bidx)
+        k = acc_k.get(bidx)
+        v = acc_v.get(bidx)
+        # default zeros if any missing
+        H = q.numel() if q is not None else (k.numel() if k is not None else v.numel())
+        zero = torch.zeros(H)
+        q = q if q is not None else zero
+        k = k if k is not None else zero
+        v = v if v is not None else zero
+        s = (q + k + v) / max(1, cnt.get(bidx, 1)) / 3.0
+        scores[bidx] = s
+    return scores
+
+# --- Attention-head pruning function ---
+def apply_attention_head_pruning(
+    model: nn.Module,
+    processor: AutoProcessor,
+    target_attn: List[AttnHandle],
+    head_scores: Dict[int, torch.Tensor],
+    head_ratio: float,
+    device: str = "cuda",
+) -> int:
+    """Prune `head_ratio` fraction of heads per selected attention block.
+    Returns total number of heads pruned across blocks.
+    """
+    if head_ratio <= 0.0:
+        return 0
+    # Build DepGraph once
+    wrapper = IJepaWrapper(model)
+    wrapper.eval().to(device)
+    size = getattr(model.config, "image_size", 224)
+    dummy = torch.zeros(1, 3, size, size, device=device)
+    DG = tp.DependencyGraph().build_dependency(wrapper, example_inputs=(dummy,))
+
+    total_heads = 0
+    pruned_heads = 0
+    for ah in target_attn:
+        sc = head_scores.get(ah.idx)
+        if sc is None or sc.numel() == 0:
+            continue
+        H = ah.num_heads
+        total_heads += H
+        k_heads = int(round(head_ratio * H))
+        if k_heads <= 0:
+            continue
+        # lowest-score head indices
+        head_ids = torch.argsort(sc)[:k_heads].tolist()
+        # expand to channel indices for q,k,v out_features
+        idxs = []
+        for h in head_ids:
+            start = h * ah.head_dim
+            idxs.extend(list(range(start, start + ah.head_dim)))
+
+        ok = True
+        # Query
+        try:
+            gq = DG.get_pruning_group(ah.query, tp.prune_linear_out_channels, idxs=idxs)
+            if DG.check_pruning_group(gq):
+                gq.prune()
+            else:
+                ok = False
+        except Exception as e:
+            print(f"[warn] Head prune (Q) failed at block {ah.idx}: {e}")
+            ok = False
+        # Key
+        try:
+            gk = DG.get_pruning_group(ah.key, tp.prune_linear_out_channels, idxs=idxs)
+            if DG.check_pruning_group(gk):
+                gk.prune()
+            else:
+                ok = False
+        except Exception as e:
+            print(f"[warn] Head prune (K) failed at block {ah.idx}: {e}")
+            ok = False
+        # Value
+        try:
+            gv = DG.get_pruning_group(ah.value, tp.prune_linear_out_channels, idxs=idxs)
+            if DG.check_pruning_group(gv):
+                gv.prune()
+            else:
+                ok = False
+        except Exception as e:
+            print(f"[warn] Head prune (V) failed at block {ah.idx}: {e}")
+            ok = False
+        # Output projection (in-channels)
+        try:
+            go = DG.get_pruning_group(ah.out, tp.prune_linear_in_channels, idxs=idxs)
+            if DG.check_pruning_group(go):
+                go.prune()
+            else:
+                ok = False
+        except Exception as e:
+            print(f"[warn] Head prune (O) failed at block {ah.idx}: {e}")
+            ok = False
+
+        if ok:
+            pruned_heads += k_heads
+            # Update static attributes so reshape stays valid
+            try:
+                new_all = ah.query.out_features
+                old_dim = ah.head_dim
+                new_heads = max(1, new_all // max(1, old_dim))
+                if hasattr(ah.attn_mod, "num_attention_heads"):
+                    ah.attn_mod.num_attention_heads = new_heads
+                if hasattr(ah.attn_mod, "all_head_size"):
+                    ah.attn_mod.all_head_size = new_all
+                if hasattr(ah.attn_mod, "attention_head_size"):
+                    ah.attn_mod.attention_head_size = old_dim
+            except Exception as e:
+                print(f"[warn] Could not update attention head attrs at block {ah.idx}: {e}")
+        else:
+            print(f"[warn] Skipped head pruning at block {ah.idx}: at least one sub-group invalid")
+
+    return pruned_heads
+
     return total_pruned
 
 
@@ -1010,7 +1386,9 @@ def knn_probe_local(
     k: int = 20,
     device: str = "cuda",
     eval_seed: int = 123,
-) -> float:
+) -> Tuple[float, float]:
+    """Returns (accuracy, avg_inference_time_ms)"""
+    import time
     model.eval().to(device)
     root = os.path.expanduser(root)
     train_dir = os.path.join(root, "train")
@@ -1045,10 +1423,26 @@ def knn_probe_local(
     train_items = train_items[: max(1, min(train_n, len(train_items)))]
     val_items = val_items[: max(1, min(val_n, len(val_items)))]
 
-    def embed_paths(paths: List[Path]) -> torch.Tensor:
+    inference_times = []
+    
+    def embed_paths(paths: List[Path], measure_time: bool = False) -> torch.Tensor:
         imgs = [Image.open(p).convert("RGB") for p in paths]
         inputs = processor(images=imgs, return_tensors="pt").to(device)
+        
+        if measure_time:
+            # Warmup
+            if device == "cuda":
+                torch.cuda.synchronize()
+            start = time.perf_counter()
+        
         out = model(**inputs).last_hidden_state.mean(dim=1)
+        
+        if measure_time:
+            if device == "cuda":
+                torch.cuda.synchronize()
+            elapsed = (time.perf_counter() - start) * 1000  # ms
+            inference_times.append(elapsed / len(paths))  # per image
+        
         out = F.normalize(out, p=2, dim=1)
         for im in imgs:
             try: im.close()
@@ -1065,12 +1459,12 @@ def knn_probe_local(
     bank = torch.cat(bank_embeds, dim=0)
     bank_labels = torch.tensor(bank_labels, device=device)
 
-    # Evaluate on val items
+    # Evaluate on val items (measure inference time)
     correct = 0
     total = 0
     for i in range(0, len(val_items), bs):
         batch = val_items[i : i + bs]
-        q = embed_paths([p for p, _ in batch])
+        q = embed_paths([p for p, _ in batch], measure_time=True)
         labels = torch.tensor([lbl for _, lbl in batch], device=device)
         sims = q @ bank.T
         topk = sims.topk(k=min(k, bank.shape[0]), dim=1).indices
@@ -1083,7 +1477,10 @@ def knn_probe_local(
         preds = torch.tensor(preds, device=device)
         correct += (preds == labels).sum().item()
         total += labels.numel()
-    return correct / max(1, total)
+    
+    accuracy = correct / max(1, total)
+    avg_inference_time = sum(inference_times) / len(inference_times) if inference_times else 0.0
+    return accuracy, avg_inference_time
 
 # ------------------------------
 # Magnitude (L2) channel scores for fc1 rows
@@ -1095,6 +1492,125 @@ def compute_magnitude_scores(target_mlps: List[MLPHandle]) -> Dict[int, torch.Te
         w = h.fc1.weight.detach()  # [out, in]
         scores[h.idx] = torch.norm(w, dim=1)  # per-out-channel L2
     return scores
+
+
+@torch.no_grad()
+def compute_wanda_scores(
+    model: nn.Module,
+    processor: AutoProcessor,
+    dataset_name: str,
+    num_images: int,
+    target_mlps: List[MLPHandle],
+    batch_size: int = 16,
+    device: str = "cuda",
+) -> Dict[int, torch.Tensor]:
+    """
+    Wanda pruning scores: |Weight| × √(Input Activation Norm²)
+    
+    For each MLP.fc1 layer:
+    - Capture input activations X during forward pass
+    - Compute activation norm: ||X||₂² per input channel
+    - Score for output channel i: ||W[i, :]||₂ × √(||X||₂²)
+    
+    Paper: "A Simple and Effective Pruning Approach for Large Language Models"
+    Sun et al. (2023) - https://arxiv.org/abs/2306.11695
+    """
+    # Storage for activation norms (squared L2 norm per input channel)
+    activation_norms: Dict[int, torch.Tensor] = {}  # {block_idx: [in_channels]}
+    sample_counts: Dict[int, int] = {}
+    
+    def make_hook(block_idx: int):
+        def hook(_mod, inp, _out):
+            # inp is a tuple, first element is the actual input tensor
+            x = inp[0]  # [B, tokens, in_channels] or [B, in_channels]
+            
+            # Flatten batch and tokens dimensions
+            if x.dim() == 3:
+                x = x.reshape(-1, x.shape[-1])  # [B*T, in_channels]
+            
+            # Compute squared L2 norm per input channel: sum over all tokens/batch
+            # This is: ∑_tokens x[token, channel]²
+            channel_norm_sq = torch.sum(x ** 2, dim=0)  # [in_channels]
+            
+            # Accumulate across batches
+            if block_idx not in activation_norms:
+                activation_norms[block_idx] = channel_norm_sq.cpu()
+                sample_counts[block_idx] = x.shape[0]
+            else:
+                activation_norms[block_idx] += channel_norm_sq.cpu()
+                sample_counts[block_idx] += x.shape[0]
+        return hook
+    
+    # Register hooks on fc1 inputs
+    handles = []
+    for h in target_mlps:
+        handles.append(h.fc1.register_forward_hook(make_hook(h.idx)))
+    
+    # Load calibration dataset
+    if dataset_name == "imagenette":
+        root = auto_download_imagenette()
+    else:
+        root = os.path.expanduser(dataset_name)
+    
+    train_dir = os.path.join(root, "train") if os.path.isdir(os.path.join(root, "train")) else root
+    paths: List[Path] = []
+    for p in Path(train_dir).rglob("*"):
+        if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp", ".webp"):
+            paths.append(p)
+    if not paths:
+        raise RuntimeError(f"No images found under: {train_dir}")
+    random.shuffle(paths)
+    paths = paths[: max(1, min(num_images, len(paths)))]
+    
+    model.eval().to(device)
+    
+    print(f"Collecting Wanda statistics from {len(paths)} images...")
+    for i in range(0, len(paths), batch_size):
+        batch_paths = paths[i : i + batch_size]
+        imgs = [Image.open(p).convert("RGB") for p in batch_paths]
+        inputs = processor(images=imgs, return_tensors="pt").to(device)
+        _ = model(**inputs)
+        for im in imgs:
+            try: im.close()
+            except Exception: pass
+    
+    # Remove hooks
+    for h in handles:
+        h.remove()
+    
+    # Compute Wanda scores: |W| × √(activation_norm²)
+    scores: Dict[int, torch.Tensor] = {}
+    for h in target_mlps:
+        block_idx = h.idx
+        if block_idx not in activation_norms:
+            raise RuntimeError(f"No activations captured for block {block_idx}")
+        
+        # Weight matrix: [out_channels, in_channels]
+        W = h.fc1.weight.detach().cpu()  # [out, in]
+        
+        # Activation norms: [in_channels]
+        act_norm_sq = activation_norms[block_idx]  # Already summed over all tokens
+        
+        # Average over samples
+        act_norm_sq = act_norm_sq / sample_counts[block_idx]
+        
+        # Wanda score per output channel:
+        # score[i] = ||W[i, :]||_2 × sqrt(sum_j ||X[:, j]||²)
+        # Simplified: score[i] = sum_j |W[i,j]| × sqrt(act_norm_sq[j])
+        
+        # Weight magnitude per output channel, per input feature
+        W_abs = torch.abs(W)  # [out, in]
+        
+        # Broadcast activation norms: [1, in] → [out, in]
+        act_sqrt = torch.sqrt(act_norm_sq.clamp(min=1e-12))  # [in]
+        
+        # Wanda metric: element-wise product, then sum over input dimension
+        # Score[out_i] = sum_j |W[out_i, in_j]| × sqrt(act_norm[in_j])
+        wanda_metric = W_abs * act_sqrt.unsqueeze(0)  # [out, in] × [1, in]
+        scores[block_idx] = torch.sum(wanda_metric, dim=1)  # [out]
+    
+    return scores
+
 
 # ------------------------------
 # Unstructured pruning (PyTorch prune) helpers
@@ -1216,6 +1732,7 @@ def main():
     p.add_argument("--nr-per-class-agg", type=str, default="var", choices=["max", "mean", "sum", "var", "std", "median", "max_minus_mean"], help="Aggregation over per-class TF-IDF scores")
     p.add_argument("--nr-per-class-power", type=float, default=1.0, help="Exponent applied to aggregated per-class discrimination score")
     p.add_argument("--nr-discrimination-weight", type=float, default=1.0, help="Weight for discrimination term in hybrid score: Score = (Variance^weight) * Magnitude")
+    p.add_argument("--beta", type=float, default=1.0, help="Multiplier for magnitude/impact score: Score = Discrimination × (beta × ||W||₂)")
     
     # Activation stats caching
     p.add_argument("--stats-cache-dir", type=str, default="./activation_stats_cache", help="Directory to cache activation statistics")
@@ -1229,6 +1746,7 @@ def main():
     p.add_argument("--nrp-beta", type=float, default=0.0, help="Optional magnitude mixing: score *= |W|**beta (0 = ignore |W|)")
     p.add_argument("--eval", type=str, choices=["none", "knn"], default="none")
     p.add_argument("--compare-mb", action="store_true", help="Also prune a fresh model with magnitude-based channel scores and report k-NN")
+    p.add_argument("--compare-wanda", action="store_true", help="Also prune a fresh model with Wanda (weights×activations) channel scores and report k-NN")
     p.add_argument("--eval-train", type=int, default=2000)
     p.add_argument("--eval-val", type=int, default=1000)
     p.add_argument("--save-dir", type=str, default="./ijepa_pruned")
@@ -1247,6 +1765,11 @@ def main():
     # Save control
     p.add_argument("--save-models", action="store_true", help="Save pruned models to disk (disabled by default to save space)")
     p.add_argument("--save-graph", action="store_true", help="Save comparison graph to disk (disabled by default)")
+
+    # --- Add attention-head pruning CLI flags ---
+    p.add_argument("--prune-heads", action="store_true", help="Enable attention head pruning before MLP pruning")
+    p.add_argument("--head-ratio", type=float, default=0.0, help="Fraction of attention heads to remove in selected blocks (0.0 disables)")
+    p.add_argument("--head-score", type=str, default="act_l1", choices=["act_l1", "act_l2"], help="Head scoring: mean |Q,K,V| (L1) or L2 over tokens")
 
     args = p.parse_args()
     
@@ -1279,12 +1802,47 @@ def main():
     target_mlps = [m for m in mlps if m.idx in target_indices]
     print(f"Discovered {len(mlps)} blocks with MLPs; targeting indices: {target_indices}")
 
-    # Baseline params
+    # Optional: attention head pruning BEFORE MLP pruning (now that args/model/targets exist)
+    if args.prune_heads and args.head_ratio > 0.0:
+        print(f"\n[Head Pruning] Collecting head scores and pruning {args.head_ratio:.2f} of heads per selected block…")
+        attn_all = find_attention_modules(model)
+        target_attn = [a for a in attn_all if a.idx in target_indices]
+        if not target_attn:
+            print("[warn] No attention modules found for requested blocks; skipping head pruning.")
+        else:
+            head_scores = collect_head_activation_scores(
+                model=model,
+                processor=processor,
+                dataset_name=args.calib_ds,
+                num_images=args.calib_samples,
+                target_attn=target_attn,
+                batch_size=args.batch_size,
+                device=args.device,
+                mode=args.head_score,
+            )
+            pruned_heads = apply_attention_head_pruning(
+                model=model,
+                processor=processor,
+                target_attn=target_attn,
+                head_scores=head_scores,
+                head_ratio=args.head_ratio,
+                device=args.device,
+            )
+            print(f"[Head Pruning] Pruned {pruned_heads} heads total across {len(target_attn)} blocks.")
+
+    # Baseline params and size
     base_params = count_params(model)
-    print(f"\nParams (before): {base_params/1e6:.2f}M")
+    base_size_gb = estimate_model_size_gb(model)
+    print(f"\n{'='*60}")
+    print(f"BASELINE MODEL SIZE")
+    print(f"{'='*60}")
+    print(f"Total parameters: {base_params/1e6:.2f}M ({base_params:,})")
+    print(f"Estimated size: {base_size_gb:.3f} GB")
+    print(f"{'='*60}\n")
 
     # Optional baseline evaluation BEFORE pruning
     acc_base = None
+    time_base = None
     if args.eval != "none":
         if args.calib_ds == "imagenette":
             eval_root = auto_download_imagenette()
@@ -1297,17 +1855,22 @@ def main():
         if len(eval_seeds) > 1:
             print(f"Running baseline k-NN (local ImageFolder at {eval_root}) with {len(eval_seeds)} seeds for stability…")
             accs = []
+            times = []
             for seed in eval_seeds:
-                acc = knn_probe_local(model, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=seed)
+                acc, inf_time = knn_probe_local(model, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=seed)
                 accs.append(acc)
+                times.append(inf_time)
                 print(f"  Seed {seed}: {acc*100:.2f}%")
             acc_base = sum(accs) / len(accs)
+            time_base = sum(times) / len(times)
             std_base = (sum((a - acc_base)**2 for a in accs) / len(accs)) ** 0.5
-            print(f"Baseline k-NN@20: top-1 = {acc_base*100:.2f}% ± {std_base*100:.2f}%\n")
+            print(f"Baseline k-NN@20: top-1 = {acc_base*100:.2f}% ± {std_base*100:.2f}%")
+            print(f"Baseline inference time: {time_base:.2f} ms/image\n")
         else:
             print(f"Running baseline k-NN (local ImageFolder at {eval_root})…")
-            acc_base = knn_probe_local(model, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=eval_seeds[0])
-        print(f"Baseline k-NN@20: top-1 = {acc_base*100:.2f}%\n")
+            acc_base, time_base = knn_probe_local(model, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=eval_seeds[0])
+            print(f"Baseline k-NN@20: top-1 = {acc_base*100:.2f}%")
+            print(f"Baseline inference time: {time_base:.2f} ms/image\n")
 
     # === Unstructured path ===
     if args.mode == "unstructured":
@@ -1383,8 +1946,8 @@ def main():
                     eval_root = auto_download_imagenette()
                 else:
                     eval_root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
-                acc_un_nrp = knn_probe_local(model_nrp, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
-                print(f"[Unstructured-NRP] k-NN@20: top-1 = {acc_un_nrp*100:.2f}%  |  Δ vs base = {(acc_un_nrp - (acc_base or acc_un_nrp)) * 100:.2f}%")
+                acc_un_nrp, time_un_nrp = knn_probe_local(model_nrp, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
+                print(f"[Unstructured-NRP] k-NN@20: top-1 = {acc_un_nrp*100:.2f}%  |  Δ vs base = {(acc_un_nrp - (acc_base or acc_un_nrp)) * 100:.2f}%  |  Inference: {time_un_nrp:.2f} ms")
             # Save
             if args.save_models:
                 out_dir_nrp = args.save_dir.rstrip("/") + "_unstr_nrp"
@@ -1407,8 +1970,8 @@ def main():
                     eval_root = auto_download_imagenette()
                 else:
                     eval_root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
-                acc_un_mb = knn_probe_local(model_mb, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
-                print(f"[Unstructured-MB]  k-NN@20: top-1 = {acc_un_mb*100:.2f}%  |  Δ vs base = {(acc_un_mb - (acc_base or acc_un_mb)) * 100:.2f}%")
+                acc_un_mb, time_un_mb = knn_probe_local(model_mb, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
+                print(f"[Unstructured-MB]  k-NN@20: top-1 = {acc_un_mb*100:.2f}%  |  Δ vs base = {(acc_un_mb - (acc_base or acc_un_mb)) * 100:.2f}%  |  Inference: {time_un_mb:.2f} ms")
             # Save
             if args.save_models:
                 out_dir_mb = args.save_dir.rstrip("/") + "_unstr_mb"
@@ -1462,11 +2025,21 @@ def main():
             except Exception as e:
                 print(f"Warning: Failed to save cache ({e})")
         
-        print(f"  Computing scores based on (Variance^{args.nr_discrimination_weight} * Weight_Magnitude)...")
+        print(f"  Computing scores based on (Variance^{args.nr_discrimination_weight} * {args.beta}×Weight_Magnitude)...")
         scores = compute_variance_magnitude_scores(
             target_mlps=target_mlps,
             activation_stats=activation_stats,
             discrimination_weight=args.nr_discrimination_weight,
+            beta=args.beta,
+        )
+        
+        # ALSO compute fc2 variant for comparison
+        print(f"  [COMPARISON] Also computing fc2-based scores (using downstream weights, beta={args.beta})...")
+        scores_fc2 = compute_variance_magnitude_scores_fc2(
+            target_mlps=target_mlps,
+            activation_stats=activation_stats,
+            discrimination_weight=args.nr_discrimination_weight,
+            beta=args.beta,
         )
     elif args.use_benchmark_nr:
         # Build cache key based on model, layers, dataset, samples, and activation threshold
@@ -1531,9 +2104,12 @@ def main():
         )
 
     # Track results for comparison table
-    results_list = []  # (ratio, nrp_acc, mb_acc, nrp_target_params, mb_target_params)
+    results_list = []  # (ratio, nrp_acc, mb_acc, wanda_acc, fc2_acc, nrp_target_params, mb_target_params, wanda_target_params, fc2_target_params, nrp_time, mb_time, wanda_time, fc2_time)
     base_target_params = count_target_mlp_params(target_mlps)
     print(f"Target MLP params (before pruning): {base_target_params/1e6:.2f}M")
+    
+    # Check if we have fc2 scores available
+    has_fc2_scores = 'scores_fc2' in locals()
 
     # Apply structured pruning (NRP) for each prune ratio
     for prune_ratio in args.prune_ratio:
@@ -1556,11 +2132,20 @@ def main():
             device=args.device,
         )
         new_params = count_params(model_pruned)
+        new_size_gb = estimate_model_size_gb(model_pruned)
+        params_reduction = (base_params - new_params) / base_params * 100
+        size_reduction = (base_size_gb - new_size_gb) / base_size_gb * 100
+        
         print(f"Pruned channels: ~{pruned} (aggregated across blocks)")
-        print(f"{''}\nParams (after NRP): {new_params/1e6:.2f}M  |  Δ = {(base_params - new_params)/1e6:.2f}M\n")
+        print(f"\n{'─'*60}")
+        print(f"Model Size After Pruning:")
+        print(f"  Params: {new_params/1e6:.2f}M  |  Δ = -{(base_params - new_params)/1e6:.2f}M ({params_reduction:.1f}% reduction)")
+        print(f"  Size:   {new_size_gb:.3f} GB  |  Δ = -{(base_size_gb - new_size_gb):.3f} GB ({size_reduction:.1f}% reduction)")
+        print(f"{'─'*60}\n")
 
         # Evaluate NRP
         acc_nrp = None
+        time_nrp = None
         nrp_target_params = count_target_mlp_params(target_mlps_pruned)
         if args.eval != "none":
             if args.calib_ds == "imagenette":
@@ -1568,11 +2153,13 @@ def main():
             else:
                 eval_root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
             print(f"Evaluating NRP model with k-NN (local ImageFolder at {eval_root})…")
-            acc_nrp = knn_probe_local(model_pruned, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
-            print(f"NRP k-NN@20: top-1 = {acc_nrp*100:.2f}%  |  Δ vs base = {(acc_nrp - (acc_base or acc_nrp)) * 100:.2f}%\n")
+            acc_nrp, time_nrp = knn_probe_local(model_pruned, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
+            speedup = (time_base / time_nrp) if (time_base and time_nrp) else 0
+            print(f"NRP k-NN@20: top-1 = {acc_nrp*100:.2f}%  |  Δ vs base = {(acc_nrp - (acc_base or acc_nrp)) * 100:.2f}%  |  Inference: {time_nrp:.2f} ms ({speedup:.2f}x speedup)\n")
 
         # Optional magnitude-based comparison
         acc_mb = None
+        time_mb = None
         mb_target_params = None
         if args.compare_mb:
             print("\n=== Magnitude-based pruning comparison ===")
@@ -1595,14 +2182,87 @@ def main():
                     eval_root = auto_download_imagenette()
                 else:
                     eval_root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
-                acc_mb = knn_probe_local(model_mb, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
-                print(f"MBP k-NN@20: top-1 = {acc_mb*100:.2f}%  |  Δ vs base = {(acc_mb - (acc_base or acc_mb)) * 100:.2f}%")
+                acc_mb, time_mb = knn_probe_local(model_mb, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
+                speedup_mb = (time_base / time_mb) if (time_base and time_mb) else 0
+                print(f"MBP k-NN@20: top-1 = {acc_mb*100:.2f}%  |  Δ vs base = {(acc_mb - (acc_base or acc_mb)) * 100:.2f}%  |  Inference: {time_mb:.2f} ms ({speedup_mb:.2f}x speedup)")
             # Save MBP too
             if args.save_models:
                 mb_dir = f"{args.save_dir}_r{int(prune_ratio*100):02d}_mbp"
                 os.makedirs(mb_dir, exist_ok=True)
                 print(f"Saving magnitude-pruned model to: {mb_dir}")
                 model_mb.save_pretrained(mb_dir)
+
+        # Optional Wanda comparison (weights × activations)
+        acc_wanda = None
+        time_wanda = None
+        wanda_target_params = None
+        if args.compare_wanda:
+            print("\n=== Wanda (weights×activations) pruning comparison ===")
+            model_wanda = AutoModel.from_pretrained(args.model_id)
+            mlps_wanda = find_mlp_modules(model_wanda)
+            target_wanda = [m for m in mlps_wanda if m.idx in target_indices]
+            print("Computing Wanda scores (|W| × √activation_norm)…")
+            wanda_scores = compute_wanda_scores(
+                model=model_wanda,
+                processor=processor,
+                dataset_name=args.calib_ds,
+                num_images=args.calib_samples,
+                target_mlps=target_wanda,
+                batch_size=args.batch_size,
+                device=args.device,
+            )
+            print(f"Applying structured pruning (Wanda): ratio={prune_ratio:.2f} on {len(target_wanda)} blocks…")
+            _ = apply_structured_mlp_pruning(
+                model=model_wanda,
+                processor=processor,
+                target_mlps=target_wanda,
+                scores=wanda_scores,
+                prune_ratio=prune_ratio,
+                device=args.device,
+            )
+            wanda_target_params = count_target_mlp_params(target_wanda)
+            if args.eval != "none":
+                if args.calib_ds == "imagenette":
+                    eval_root = auto_download_imagenette()
+                else:
+                    eval_root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
+                acc_wanda, time_wanda = knn_probe_local(model_wanda, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
+                speedup_wanda = (time_base / time_wanda) if (time_base and time_wanda) else 0
+                print(f"Wanda k-NN@20: top-1 = {acc_wanda*100:.2f}%  |  Δ vs base = {(acc_wanda - (acc_base or acc_wanda)) * 100:.2f}%  |  Inference: {time_wanda:.2f} ms ({speedup_wanda:.2f}x speedup)")
+            # Save Wanda too
+            if args.save_models:
+                wanda_dir = f"{args.save_dir}_r{int(prune_ratio*100):02d}_wanda"
+                os.makedirs(wanda_dir, exist_ok=True)
+                print(f"Saving Wanda-pruned model to: {wanda_dir}")
+                model_wanda.save_pretrained(wanda_dir)
+
+        # Optional fc2-based NeuronRank comparison (uses downstream weights)
+        acc_fc2 = None
+        time_fc2 = None
+        fc2_target_params = None
+        if has_fc2_scores:
+            print("\n=== NeuronRank-fc2 (Var×fc2_weights) pruning comparison ===")
+            model_fc2 = copy.deepcopy(model)
+            mlps_fc2 = find_mlp_modules(model_fc2)
+            target_fc2 = [m for m in mlps_fc2 if m.idx in target_indices]
+            print(f"Applying structured pruning (NR-fc2): ratio={prune_ratio:.2f} on {len(target_fc2)} blocks…")
+            _ = apply_structured_mlp_pruning(
+                model=model_fc2,
+                processor=processor,
+                target_mlps=target_fc2,
+                scores=scores_fc2,
+                prune_ratio=prune_ratio,
+                device=args.device,
+            )
+            fc2_target_params = count_target_mlp_params(target_fc2)
+            if args.eval != "none":
+                if args.calib_ds == "imagenette":
+                    eval_root = auto_download_imagenette()
+                else:
+                    eval_root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
+                acc_fc2, time_fc2 = knn_probe_local(model_fc2, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
+                speedup_fc2 = (time_base / time_fc2) if (time_base and time_fc2) else 0
+                print(f"NR-fc2 k-NN@20: top-1 = {acc_fc2*100:.2f}%  |  Δ vs base = {(acc_fc2 - (acc_base or acc_fc2)) * 100:.2f}%  |  Inference: {time_fc2:.2f} ms ({speedup_fc2:.2f}x speedup)")
 
         # Save NRP model with ratio in directory name
         if args.save_models:
@@ -1618,74 +2278,159 @@ def main():
                 prune_ratio,
                 acc_nrp,
                 acc_mb,
+                acc_wanda,
+                acc_fc2,
                 nrp_target_params,
-                mb_target_params
+                mb_target_params,
+                wanda_target_params,
+                fc2_target_params,
+                time_nrp,
+                time_mb,
+                time_wanda,
+                time_fc2
             ))
 
     # Summary
     if args.eval != "none":
         print("\n=== Summary (k-NN@20 top-1) ===")
-        if acc_base is not None: print(f"Base : {acc_base*100:.2f}%")
-        if acc_nrp is not None:  print(f"NRP  : {acc_nrp*100:.2f}%  (Δ {((acc_nrp - acc_base) if acc_base is not None else 0)*100:.2f}%)")
+        if acc_base is not None: print(f"Base    : {acc_base*100:.2f}%")
+        if acc_nrp is not None:  print(f"NR-fc1  : {acc_nrp*100:.2f}%  (Δ {((acc_nrp - acc_base) if acc_base is not None else 0)*100:.2f}%)")
+        if has_fc2_scores and 'acc_fc2' in locals():
+            print(f"NR-fc2  : {acc_fc2*100:.2f}%  (Δ {((acc_fc2 - acc_base) if acc_base is not None else 0)*100:.2f}%)")
         if args.compare_mb and 'acc_mb' in locals():
-            print(f"MBP  : {acc_mb*100:.2f}%  (Δ {((acc_mb - acc_base) if acc_base is not None else 0)*100:.2f}%)")
+            print(f"MB      : {acc_mb*100:.2f}%  (Δ {((acc_mb - acc_base) if acc_base is not None else 0)*100:.2f}%)")
+        if args.compare_wanda and 'acc_wanda' in locals():
+            print(f"Wanda   : {acc_wanda*100:.2f}%  (Δ {((acc_wanda - acc_base) if acc_base is not None else 0)*100:.2f}%)")
 
     # === Final Comparison Table ===
     if len(results_list) > 0 and args.eval != "none":
-        print("\n" + "="*110)
-        print("FINAL COMPARISON: NeuronRank vs Magnitude-Based Pruning")
-        print("="*110)
+        print("\n" + "="*120)
+        print("FINAL COMPARISON: NeuronRank vs Baselines (Magnitude + Wanda)")
+        print("="*120)
         
         # Table header
-        print(f"\n{'Sparsity':<10} {'Method':<8} {'Params (M)':<12} {'Compression':<14} {'k-NN Acc':<12} {'Δ Acc':<12}")
-        print("-" * 110)
+        print(f"\n{'Sparsity':<10} {'Method':<8} {'Params (M)':<12} {'Compression':<14} {'k-NN Acc':<12} {'Δ Acc':<12} {'Inference':<14} {'Speedup':<10}")
+        print("-" * 140)
         
         # Baseline row
         if acc_base is not None:
-            print(f"{'0%':<10} {'Base':<8} {base_target_params/1e6:>10.2f}   {'1.00x':>12}   {acc_base*100:>10.2f}%  {'-':>10}")
-            print("-" * 110)
+            base_time_str = f"{time_base:.2f} ms" if time_base else "-"
+            print(f"{'0%':<10} {'Base':<8} {base_target_params/1e6:>10.2f}   {'1.00x':>12}   {acc_base*100:>10.2f}%  {'-':>10}   {base_time_str:>12}   {'1.00x':>8}")
+            print("-" * 140)
         
         # Results rows
-        for ratio, nrp_acc, mb_acc, nrp_params, mb_params in results_list:
+        for ratio, nrp_acc, mb_acc, wanda_acc, fc2_acc, nrp_params, mb_params, wanda_params, fc2_params, nrp_time, mb_time, wanda_time, fc2_time in results_list:
             sparsity_pct = ratio * 100
             
-            # NeuronRank row
+            # NeuronRank (fc1) row
             if nrp_acc is not None and nrp_params is not None:
                 compression_nr = base_target_params / nrp_params if nrp_params > 0 else 0
                 delta_acc_nr = (nrp_acc - acc_base) * 100 if acc_base else 0
-                print(f"{f'{sparsity_pct:.0f}%':<10} {'NR':<8} {nrp_params/1e6:>10.2f}   {f'{compression_nr:.2f}x':>12}   {nrp_acc*100:>10.2f}%  {delta_acc_nr:>+9.2f}%")
+                speedup_nr = (time_base / nrp_time) if (time_base and nrp_time) else 0
+                time_str_nr = f"{nrp_time:.2f} ms" if nrp_time else "-"
+                speedup_str_nr = f"{speedup_nr:.2f}x" if speedup_nr else "-"
+                print(f"{f'{sparsity_pct:.0f}%':<10} {'NR-fc1':<8} {nrp_params/1e6:>10.2f}   {f'{compression_nr:.2f}x':>12}   {nrp_acc*100:>10.2f}%  {delta_acc_nr:>+9.2f}%   {time_str_nr:>12}   {speedup_str_nr:>8}")
+            
+            # NeuronRank (fc2) row
+            if has_fc2_scores and fc2_acc is not None and fc2_params is not None:
+                compression_fc2 = base_target_params / fc2_params if fc2_params > 0 else 0
+                delta_acc_fc2 = (fc2_acc - acc_base) * 100 if acc_base else 0
+                speedup_fc2 = (time_base / fc2_time) if (time_base and fc2_time) else 0
+                time_str_fc2 = f"{fc2_time:.2f} ms" if fc2_time else "-"
+                speedup_str_fc2 = f"{speedup_fc2:.2f}x" if speedup_fc2 else "-"
+                print(f"{'':<10} {'NR-fc2':<8} {fc2_params/1e6:>10.2f}   {f'{compression_fc2:.2f}x':>12}   {fc2_acc*100:>10.2f}%  {delta_acc_fc2:>+9.2f}%   {time_str_fc2:>12}   {speedup_str_fc2:>8}")
             
             # Magnitude-based row
             if args.compare_mb and mb_acc is not None and mb_params is not None:
                 compression_mb = base_target_params / mb_params if mb_params > 0 else 0
                 delta_acc_mb = (mb_acc - acc_base) * 100 if acc_base else 0
-                print(f"{'':<10} {'MB':<8} {mb_params/1e6:>10.2f}   {f'{compression_mb:.2f}x':>12}   {mb_acc*100:>10.2f}%  {delta_acc_mb:>+9.2f}%")
-                print("-" * 110)
-            else:
-                print("-" * 110)
+                speedup_mb = (time_base / mb_time) if (time_base and mb_time) else 0
+                time_str_mb = f"{mb_time:.2f} ms" if mb_time else "-"
+                speedup_str_mb = f"{speedup_mb:.2f}x" if speedup_mb else "-"
+                print(f"{'':<10} {'MB':<8} {mb_params/1e6:>10.2f}   {f'{compression_mb:.2f}x':>12}   {mb_acc*100:>10.2f}%  {delta_acc_mb:>+9.2f}%   {time_str_mb:>12}   {speedup_str_mb:>8}")
+            
+            # Wanda row
+            if args.compare_wanda and wanda_acc is not None and wanda_params is not None:
+                compression_wanda = base_target_params / wanda_params if wanda_params > 0 else 0
+                delta_acc_wanda = (wanda_acc - acc_base) * 100 if acc_base else 0
+                speedup_wanda = (time_base / wanda_time) if (time_base and wanda_time) else 0
+                time_str_wanda = f"{wanda_time:.2f} ms" if wanda_time else "-"
+                speedup_str_wanda = f"{speedup_wanda:.2f}x" if speedup_wanda else "-"
+                print(f"{'':<10} {'Wanda':<8} {wanda_params/1e6:>10.2f}   {f'{compression_wanda:.2f}x':>12}   {wanda_acc*100:>10.2f}%  {delta_acc_wanda:>+9.2f}%   {time_str_wanda:>12}   {speedup_str_wanda:>8}")
+            
+            print("-" * 140)
         
         # Key insights
-        if args.compare_mb and len(results_list) > 0:
+        if (args.compare_mb or args.compare_wanda) and len(results_list) > 0:
             print("\nKEY INSIGHTS:")
             # Find best NR performance
             best_nr = max([(r[0], r[1]) for r in results_list if r[1] is not None], key=lambda x: x[1], default=(0, 0))
             print(f"  • Best NR performance: {best_nr[0]*100:.0f}% sparsity → {best_nr[1]*100:.2f}% accuracy")
             
-            # Average advantage
-            advantages = [(r[1] - r[2]) * 100 for r in results_list if r[1] is not None and r[2] is not None]
-            if advantages:
-                avg_adv = sum(advantages) / len(advantages)
-                print(f"  • Average NR advantage over MB: {avg_adv:+.2f}%")
+            # Average advantage over MB
+            if args.compare_mb:
+                advantages = [(r[1] - r[2]) * 100 for r in results_list if r[1] is not None and r[2] is not None]
+                if advantages:
+                    avg_adv = sum(advantages) / len(advantages)
+                    print(f"  • Average NR advantage over MB: {avg_adv:+.2f}%")
+            
+            # Average advantage over Wanda
+            if args.compare_wanda:
+                advantages_wanda = [(r[1] - r[3]) * 100 for r in results_list if r[1] is not None and r[3] is not None]
+                if advantages_wanda:
+                    avg_adv_wanda = sum(advantages_wanda) / len(advantages_wanda)
+                    print(f"  • Average NR advantage over Wanda: {avg_adv_wanda:+.2f}%")
             
             # Most aggressive pruning
             if results_list:
                 most_aggressive = max(results_list, key=lambda x: x[0])
-                if most_aggressive[1] is not None and most_aggressive[3] is not None:
-                    comp_rate = base_target_params / most_aggressive[3]
+                if most_aggressive[1] is not None and most_aggressive[4] is not None:
+                    comp_rate = base_target_params / most_aggressive[4]
                     retention = (most_aggressive[1] / acc_base * 100) if acc_base else 0
-                    print(f"  • Most aggressive: {most_aggressive[0]*100:.0f}% sparsity → {comp_rate:.2f}x compression, {retention:.1f}% accuracy retention")
+                    # Extract inference times (now at index 7)
+                    ma_time = most_aggressive[7] if len(most_aggressive) > 7 else None
+                    ma_speedup = (time_base / ma_time) if (time_base and ma_time) else 0
+                    print(f"  • Most aggressive: {most_aggressive[0]*100:.0f}% sparsity → {comp_rate:.2f}x compression, {retention:.1f}% accuracy retention, {ma_speedup:.2f}x speedup")
         
-        print("="*110)
+        print("="*140)
+        
+        # === Model Size Summary ===
+        print("\n" + "="*80)
+        print("MODEL SIZE COMPARISON")
+        print("="*80)
+        print(f"{'Configuration':<30} {'Total Params':<15} {'Model Size':<15} {'Reduction':<15}")
+        print("-" * 80)
+        print(f"{'Baseline (unpruned)':<30} {base_params/1e6:>12.2f}M   {base_size_gb:>12.3f} GB   {'-':>12}")
+        
+        # Calculate sizes for each pruned configuration
+        if len(results_list) > 0:
+            for ratio, _, _, _, nrp_params, mb_params, wanda_params, _, _, _ in results_list:
+                # Rough estimate: assume params scale proportionally to target layer reduction
+                target_reduction = (base_target_params - nrp_params) / base_target_params
+                estimated_total_params = base_params - (base_target_params - nrp_params)
+                estimated_size = base_size_gb * (estimated_total_params / base_params)
+                size_reduction = (1 - estimated_size / base_size_gb) * 100
+                
+                config_name = f"NR @ {ratio*100:.0f}% sparsity"
+                print(f"{config_name:<30} {estimated_total_params/1e6:>12.2f}M   {estimated_size:>12.3f} GB   {size_reduction:>11.1f}%")
+                
+                if mb_params:
+                    mb_estimated_total = base_params - (base_target_params - mb_params)
+                    mb_estimated_size = base_size_gb * (mb_estimated_total / base_params)
+                    mb_size_reduction = (1 - mb_estimated_size / base_size_gb) * 100
+                    config_name_mb = f"MB @ {ratio*100:.0f}% sparsity"
+                    print(f"{config_name_mb:<30} {mb_estimated_total/1e6:>12.2f}M   {mb_estimated_size:>12.3f} GB   {mb_size_reduction:>11.1f}%")
+                
+                if wanda_params:
+                    wanda_estimated_total = base_params - (base_target_params - wanda_params)
+                    wanda_estimated_size = base_size_gb * (wanda_estimated_total / base_params)
+                    wanda_size_reduction = (1 - wanda_estimated_size / base_size_gb) * 100
+                    config_name_wanda = f"Wanda @ {ratio*100:.0f}% sparsity"
+                    print(f"{config_name_wanda:<30} {wanda_estimated_total/1e6:>12.2f}M   {wanda_estimated_size:>12.3f} GB   {wanda_size_reduction:>11.1f}%")
+        
+        print("="*80)
+        print("Note: Total model size includes all layers (pruned MLP + unpruned attention/embeddings)")
+        print("="*80 + "\n")
         
         # === Matplotlib Graph ===
         if len(results_list) > 1 and HAS_MATPLOTLIB:
@@ -1709,6 +2454,13 @@ def main():
                     plt.plot(sparsities, mb_accs, marker='s', linewidth=2.5, markersize=8,
                             label='Magnitude-Based', color='#A23B72', linestyle='--')
             
+            # Plot Wanda if available
+            if args.compare_wanda:
+                wanda_accs = [acc_base * 100 if acc_base else 0] + [r[3] * 100 if r[3] else 0 for r in results_list if r[3] is not None]
+                if len(wanda_accs) == len(sparsities):
+                    plt.plot(sparsities, wanda_accs, marker='^', linewidth=2.5, markersize=8,
+                            label='Wanda', color='#F18F01', linestyle='-.')
+            
             # Baseline horizontal line
             if acc_base is not None:
                 plt.axhline(y=acc_base * 100, color='#06A77D', linestyle=':', linewidth=2, 
@@ -1717,7 +2469,7 @@ def main():
             # Formatting
             plt.xlabel('Sparsity (%)', fontsize=12, fontweight='bold')
             plt.ylabel('k-NN Accuracy (%)', fontsize=12, fontweight='bold')
-            plt.title('Pruning Performance: Accuracy vs Sparsity', fontsize=14, fontweight='bold', pad=20)
+            plt.title('Pruning Performance: NeuronRank vs Baselines', fontsize=14, fontweight='bold', pad=20)
             plt.legend(loc='best', fontsize=11, framealpha=0.9)
             plt.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
             
@@ -1726,6 +2478,8 @@ def main():
             all_accs = nr_accs.copy()
             if args.compare_mb and 'mb_accs' in locals():
                 all_accs.extend(mb_accs)
+            if args.compare_wanda and 'wanda_accs' in locals():
+                all_accs.extend(wanda_accs)
             acc_min = min(all_accs) - 2
             acc_max = max(all_accs) + 2
             plt.ylim(acc_min, acc_max)
