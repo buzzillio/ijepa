@@ -38,7 +38,7 @@ Dependencies
 - datasets
 - pillow
 - torch-pruning >= 1.2
-- **optional for linear probe**: scikit-learn (if you prefer sklearn’s LogisticRegression, otherwise the script uses k-NN)
+- **optional for linear probe**: scikit-learn (if you prefer sklearn's LogisticRegression, otherwise the script uses k-NN)
 
 Notes
 -----
@@ -65,6 +65,7 @@ from torch.nn.utils import prune
 import torch.nn.functional as F
 from PIL import Image
 from pathlib import Path
+from torch.utils.hooks import RemovableHandle
 
 try:
     import torch_pruning as tp
@@ -73,6 +74,15 @@ except Exception as e:
 
 from transformers import AutoModel, AutoProcessor
 from datasets import load_dataset
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # Non-interactive backend
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+    print("Warning: matplotlib not installed. Graph visualization will be skipped.")
 
 EPS = 1e-12
 
@@ -88,6 +98,21 @@ def seed_all(seed: int = 42):
 
 def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
+
+
+def count_target_mlp_params(target_mlps: List) -> int:
+    """Count parameters in target MLP layers (fc1 + fc2)."""
+    total = 0
+    for mlp_handle in target_mlps:
+        # fc1 weight + bias
+        total += mlp_handle.fc1.weight.numel()
+        if mlp_handle.fc1.bias is not None:
+            total += mlp_handle.fc1.bias.numel()
+        # fc2 weight + bias
+        total += mlp_handle.fc2.weight.numel()
+        if mlp_handle.fc2.bias is not None:
+            total += mlp_handle.fc2.bias.numel()
+    return total
 
 
 @dataclass
@@ -185,7 +210,7 @@ def _resolve_imagefolder_root_and_split(spec: str) -> Tuple[str, str]:
     return os.path.expanduser(spec), "train"
 
 
-def auto_download_imagenette(dataset_dir: str = "~/Datasets") -> str:
+def auto_download_imagenette(dataset_dir: str = "./datasets") -> str:
     """Auto-download Imagenette2-320 if not present.
     
     Returns the path to the extracted dataset.
@@ -240,7 +265,348 @@ def auto_download_imagenette(dataset_dir: str = "~/Datasets") -> str:
 
 
 # ------------------------------
-# Benchmark-style NeuronRank (pre-activation, TF-IDF)
+# Post-Activation Class-Variance NeuronRank (output neurons, class-aware)
+# ------------------------------
+@torch.no_grad()
+def collect_postactivation_stats(
+    model: nn.Module,
+    processor: AutoProcessor,
+    dataset_name: str,
+    num_images: int,
+    target_mlps: List[MLPHandle],
+    batch_size: int = 16,
+    device: str = "cuda",
+) -> Dict[str, Dict]:
+    """Collect post-GELU activation statistics for variance-based scoring.
+    
+    Returns dict: {module_name: {
+        'mean_abs_activation': [out_channels],
+        'sample_count': int,
+        'per_class': {class_id: {'mean_abs_activation', 'sample_count'}}
+    }}
+    """
+    stats: Dict[str, Dict] = {"_meta": {"collect_per_class": True}}
+    gelu = nn.GELU()
+    handles: List[RemovableHandle] = []
+    current_batch_label_tensor: Optional[torch.Tensor] = None
+    
+    # Register hooks on fc1 modules (post-activation)
+    for h in target_mlps:
+        name = h.name + ".intermediate.dense" if h.name.startswith("encoder.layer") else h.name + ".fc1"
+        
+        def make_hook(layer_name: str):
+            def hook(_module, _inputs, output):
+                nonlocal current_batch_label_tensor
+                # Apply GELU to get post-activation
+                a = gelu(output)  # [B, T, out_features]
+                
+                # Flatten batch & sequence
+                if a.dim() == 3:
+                    a_flat = a.flatten(0, 1)  # [B*T, out_features]
+                    tokens_per_sample = a.shape[1]
+                elif a.dim() == 2:
+                    a_flat = a
+                    tokens_per_sample = 1
+                else:
+                    a_flat = a
+                    tokens_per_sample = 1
+                
+                a_flat = a_flat.to(dtype=torch.float32, device='cpu')
+                abs_act = a_flat.abs()
+                
+                # Overall pooled stats
+                layer_stats = stats.setdefault(layer_name, {
+                    'sum_abs_activation': torch.zeros(a_flat.size(-1), dtype=torch.float32),
+                    'sample_count': 0,
+                    'per_class': {},
+                })
+                layer_stats['sum_abs_activation'] += abs_act.sum(dim=0)
+                layer_stats['sample_count'] += a_flat.size(0)
+
+                if layer_stats['per_class'] is not None and current_batch_label_tensor is not None:
+                    labels_tensor = current_batch_label_tensor
+                    if tokens_per_sample > 1:
+                        labels_tensor = labels_tensor.repeat_interleave(tokens_per_sample)
+                    if labels_tensor.numel() != a_flat.size(0):
+                        return
+                    per_class_stats = layer_stats['per_class']
+                    labels_unique = labels_tensor.unique(sorted=True)
+                    for cls_id in labels_unique.tolist():
+                        cls_mask = labels_tensor == cls_id
+                        if not torch.any(cls_mask):
+                            continue
+                        cls_values = abs_act[cls_mask]
+                        cls_entry = per_class_stats.setdefault(cls_id, {
+                            'sum_abs_activation': torch.zeros(a_flat.size(-1), dtype=torch.float32),
+                            'sample_count': 0,
+                        })
+                        cls_entry['sum_abs_activation'] += cls_values.sum(dim=0)
+                        cls_entry['sample_count'] += cls_values.size(0)
+            return hook
+        
+        handles.append(h.fc1.register_forward_hook(make_hook(name)))
+    
+    # Load calibration dataset
+    model.eval().to(device)
+    
+    if dataset_name == "imagenette":
+        root = auto_download_imagenette()
+    else:
+        root = os.path.expanduser(dataset_name)
+    
+    train_dir = os.path.join(root, "train") if os.path.isdir(os.path.join(root, "train")) else root
+    
+    # Load images with labels for per-class stats
+    from pathlib import Path
+    cls_dirs = sorted([d for d in Path(train_dir).iterdir() if d.is_dir()])
+    cls_to_idx = {d.name: i for i, d in enumerate(cls_dirs)}
+    
+    items: List[Tuple[Path, int]] = []
+    for cls_name, idx in cls_to_idx.items():
+        d = Path(train_dir) / cls_name
+        for p in d.rglob("*"):
+            if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp", ".webp"):
+                items.append((p, idx))
+    
+    if not items:
+        raise RuntimeError(f"No images found under: {train_dir}")
+    
+    # Sample deterministically
+    items = sorted(items, key=lambda x: str(x[0]))
+    sample_rng = random.Random(42)
+    sample_rng.shuffle(items)
+    items = items[:min(num_images, len(items))]
+    
+    # Process batches
+    for i in range(0, len(items), batch_size):
+        batch_items = items[i : i + batch_size]
+        imgs = [Image.open(p).convert("RGB") for p, _ in batch_items]
+        labels = [lbl for _, lbl in batch_items]
+        
+        current_batch_label_tensor = torch.tensor(labels, dtype=torch.long)
+        inputs = processor(images=imgs, return_tensors="pt").to(device)
+        _ = model(**inputs)
+        current_batch_label_tensor = None
+        
+        for im in imgs:
+            try: im.close()
+            except Exception: pass
+    
+    for handle in handles:
+        handle.remove()
+
+    # Compute means
+    for layer_name, layer_stats in stats.items():
+        if layer_name == "_meta":
+            continue
+        count = layer_stats['sample_count']
+        if count > 0:
+            layer_stats['mean_abs_activation'] = layer_stats['sum_abs_activation'] / count
+        else:
+            layer_stats['mean_abs_activation'] = torch.zeros_like(layer_stats['sum_abs_activation'])
+        del layer_stats['sum_abs_activation']
+
+        if layer_stats['per_class']:
+            for cls_id, cls_stats in layer_stats['per_class'].items():
+                cls_count = cls_stats['sample_count']
+                if cls_count > 0:
+                    cls_stats['mean_abs_activation'] = cls_stats['sum_abs_activation'] / cls_count
+                else:
+                    cls_stats['mean_abs_activation'] = torch.zeros_like(cls_stats['sum_abs_activation'])
+                del cls_stats['sum_abs_activation']
+    
+    return stats
+
+
+@torch.no_grad()
+def compute_variance_magnitude_scores(
+    target_mlps: List[MLPHandle],
+    activation_stats: Dict[str, Dict],
+    discrimination_weight: float = 1.0,
+) -> Dict[int, torch.Tensor]:
+    """
+    Computes a hybrid score for each channel by combining class-discriminative
+    variance with the magnitude (L2 norm) of its corresponding weights.
+    
+    Score = Variance(per-class means) * L2_Norm(outgoing_weights)
+    
+    This rewards channels that are both selective and have large weights.
+    
+    Returns {block_idx: scores[out_channels]} for structured pruning.
+    """
+    score_map: Dict[int, torch.Tensor] = {}
+
+    for h in target_mlps:
+        name = h.name + ".intermediate.dense" if h.name.startswith("encoder.layer") else h.name + ".fc1"
+        stats = activation_stats.get(name)
+
+        if not stats or not stats.get('per_class'):
+            print(f"[warn] No per-class stats for {name}, cannot compute score. Skipping.")
+            continue
+
+        per_class_stats = stats['per_class']
+        class_means = [
+            s['mean_abs_activation']
+            for s in per_class_stats.values()
+            if s.get('sample_count', 0) > 0 and 'mean_abs_activation' in s
+        ]
+
+        if not class_means:
+            num_channels = h.fc1.out_features
+            score_map[h.idx] = torch.zeros(num_channels)
+            continue
+            
+        class_means_tensor = torch.stack(class_means, dim=0)
+
+        # 1. Discrimination Score: Variance across classes
+        variance_score = torch.var(class_means_tensor, dim=0, unbiased=False)
+        
+        # 2. Impact Score: L2 norm of fc1 outgoing weights
+        weights = h.fc1.weight.detach().to(dtype=torch.float32, device='cpu')
+        magnitude_score = torch.norm(weights, p=2, dim=1)
+        
+        # Normalize both scores to [0, 1] to ensure fair contribution
+        var_min, var_max = variance_score.min(), variance_score.max()
+        if var_max > var_min:
+            variance_score = (variance_score - var_min) / (var_max - var_min)
+
+        mag_min, mag_max = magnitude_score.min(), magnitude_score.max()
+        if mag_max > mag_min:
+            magnitude_score = (magnitude_score - mag_min) / (mag_max - mag_min)
+            
+        # Apply discrimination weight: Score = (Variance^weight) * Magnitude
+        if discrimination_weight != 1.0:
+            variance_score = variance_score.pow(discrimination_weight)
+            
+        # Final Score = Weighted Discrimination * Impact
+        channel_scores = variance_score * magnitude_score
+        
+        score_map[h.idx] = channel_scores
+
+    return score_map
+
+
+@torch.no_grad()
+def compute_postactivation_tfidf_scores(
+    target_mlps: List[MLPHandle],
+    activation_stats: Dict[str, Dict],
+    *,
+    tf_power: float = 1.0,
+    idf_power: float = 1.0,
+    idf_add: float = 1.0,
+    idf_smooth: float = 1.0,
+    weight_power: float = 0.0,  # Optional weight mixing
+    use_per_class: bool = False,
+    per_class_agg: str = "max",
+    per_class_power: float = 1.0,
+) -> Dict[int, torch.Tensor]:
+    """Compute per-channel scores from post-activation TF-IDF stats.
+    
+    Returns {block_idx: scores[out_channels]} for structured pruning.
+    """
+    score_map: Dict[int, torch.Tensor] = {}
+    cache_meta = activation_stats.get("_meta", {}) if isinstance(activation_stats, dict) else {}
+    stats_have_per_class = bool(cache_meta.get("collect_per_class", False))
+    
+    per_class_agg = (per_class_agg or "max").lower()
+
+    for h in target_mlps:
+        name = h.name + ".intermediate.dense" if h.name.startswith("encoder.layer") else h.name + ".fc1"
+        stats = activation_stats.get(name)
+        if not stats:
+            continue
+        
+        if use_per_class and stats_have_per_class and not stats.get('per_class'):
+            print(f"[warn] Block {h.idx} lacks per-class stats in cache; falling back to global TF-IDF")
+
+        sample_count = int(stats.get('sample_count', 0))
+        if sample_count == 0:
+            continue
+        
+        mean_abs_activation = stats.get('mean_abs_activation')
+        doc_freq = stats.get('doc_freq')
+        if mean_abs_activation is None or doc_freq is None:
+            continue
+        
+        mean_abs_activation = mean_abs_activation.to(torch.float32)
+        doc_freq = doc_freq.to(torch.float32)
+        
+        # TF component: per-output-channel mean activation (how strong it fires)
+        tf_component = mean_abs_activation.clamp(min=0.0).pow(tf_power)  # [out]
+        
+        # IDF component: per-output-channel rarity (how selective it is)
+        smooth = idf_smooth if idf_smooth > 0 else 0.0
+        numerator_value = float(sample_count) + smooth + EPS
+        numerator = torch.tensor(numerator_value, dtype=torch.float32)
+        denominator = doc_freq + smooth + EPS
+        idf_component = torch.log(numerator / denominator)
+        if idf_add != 0.0:
+            idf_component = idf_component + idf_add
+        idf_component = idf_component.clamp(min=0.0).pow(idf_power)  # [out]
+        
+        # Base score: TF × IDF
+        channel_scores = tf_component * idf_component  # [out]
+        
+        # Optional per-class discrimination
+        if use_per_class and stats_have_per_class and stats.get('per_class'):
+            per_class_entries = [v for v in stats['per_class'].values() if v.get('sample_count', 0) > 0]
+            if per_class_entries:
+                per_class_tfidf: List[torch.Tensor] = []
+                doc_freq_total = doc_freq + idf_smooth + EPS
+                for cls_stats in per_class_entries:
+                    cls_count = float(cls_stats.get('sample_count', 0))
+                    if cls_count <= 0:
+                        continue
+                    cls_mean = cls_stats.get('mean_abs_activation')
+                    cls_df = cls_stats.get('doc_freq')
+                    if cls_mean is None or cls_df is None:
+                        continue
+                    cls_mean = cls_mean.to(torch.float32)
+                    cls_df = cls_df.to(torch.float32)
+                    tf_cls = cls_mean.clamp(min=0.0).pow(tf_power)
+                    # Selectivity relative to global frequency: log((global DF + smooth)/(class DF + smooth))
+                    cls_denominator = cls_df + idf_smooth + EPS
+                    selectivity = torch.log(torch.clamp(doc_freq_total / cls_denominator, min=1.0))
+                    if idf_add != 0.0:
+                        selectivity = selectivity + idf_add
+                    selectivity = selectivity.clamp(min=0.0).pow(idf_power)
+                    per_class_tfidf.append(tf_cls * selectivity)
+
+                if per_class_tfidf:
+                    cls_stack = torch.stack(per_class_tfidf, dim=0)
+                    if per_class_agg == "max":
+                        discrim = cls_stack.max(dim=0).values
+                    elif per_class_agg == "mean":
+                        discrim = cls_stack.mean(dim=0)
+                    elif per_class_agg == "sum":
+                        discrim = cls_stack.sum(dim=0)
+                    elif per_class_agg == "var":
+                        discrim = cls_stack.var(dim=0, unbiased=False)
+                    elif per_class_agg == "std":
+                        discrim = cls_stack.var(dim=0, unbiased=False).sqrt()
+                    elif per_class_agg == "median":
+                        discrim = cls_stack.median(dim=0).values
+                    elif per_class_agg == "max_minus_mean":
+                        discrim = cls_stack.max(dim=0).values - cls_stack.mean(dim=0)
+                    else:
+                        raise ValueError(f"Unknown per_class_agg='{per_class_agg}'")
+                    discrim = discrim.clamp(min=0.0).pow(per_class_power)
+                    # Blend by geometric mean to keep scale stable.
+                    channel_scores = torch.sqrt(channel_scores.clamp(min=0.0) * (discrim + EPS))
+
+        # Optional: mix with weight magnitude
+        if weight_power > 0.0:
+            weight = h.fc1.weight.detach().to(dtype=torch.float32, device='cpu')  # [out, in]
+            weight_norms = torch.norm(weight, dim=1).pow(weight_power)  # [out]
+            channel_scores = channel_scores * weight_norms
+        
+        score_map[h.idx] = channel_scores
+    
+    return score_map
+
+
+# ------------------------------
+# Benchmark-style NeuronRank (pre-activation, TF-IDF) - DEPRECATED
 # ------------------------------
 @torch.no_grad()
 def collect_activation_statistics_ijepa(
@@ -486,26 +852,30 @@ def collect_neuronrank_scores(
 
     # Load calibration dataset (Imagenette 320px by default)
     if dataset_name == "imagenette":
-        ds = load_dataset("frgfm/imagenette", "320px", split="train")
-        # Reduce to num_images
-        ds = ds.shuffle(seed=123).select(range(min(num_images, len(ds))))
-        get_image = lambda rec: rec["image"]
-        get_label = lambda rec: rec.get("label", 0)
+        root = auto_download_imagenette()
     else:
-        # Assume local folder processed by datasets ImageFolder
-        ds = load_dataset("imagefolder", data_dir=dataset_name, split="train")
-        ds = ds.shuffle(seed=123).select(range(min(num_images, len(ds))))
-        get_image = lambda rec: rec["image"]
-        get_label = lambda rec: rec.get("label", 0)
+        root = os.path.expanduser(dataset_name)
+
+    train_dir = os.path.join(root, "train") if os.path.isdir(os.path.join(root, "train")) else root
+    paths: List[Path] = []
+    for p in Path(train_dir).rglob("*"):
+        if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp", ".webp"):
+            paths.append(p)
+    if not paths:
+        raise RuntimeError(f"No images found under: {train_dir}")
+    random.shuffle(paths)
+    paths = paths[: max(1, min(num_images, len(paths)))]
 
     model.eval().to(device)
 
-    loader_idxs = list(range(len(ds)))
-    for i in range(0, len(loader_idxs), batch_size):
-        batch = [ds[j] for j in loader_idxs[i : i + batch_size]]
-        images = [get_image(rec).convert("RGB") if isinstance(get_image(rec), Image.Image) else Image.fromarray(get_image(rec).numpy()) for rec in batch]
-        inputs = processor(images=images, return_tensors="pt").to(device)
+    for i in range(0, len(paths), batch_size):
+        batch_paths = paths[i : i + batch_size]
+        imgs = [Image.open(p).convert("RGB") for p in batch_paths]
+        inputs = processor(images=imgs, return_tensors="pt").to(device)
         _ = model(**inputs)
+        for im in imgs:
+            try: im.close()
+            except Exception: pass
 
     # Remove hooks
     for h in handles:
@@ -827,8 +1197,8 @@ def main():
     p.add_argument("--model-id", type=str, default="facebook/ijepa_vith14_1k")
     p.add_argument("--device", type=str, default=default_device, help=f"Device to use (auto-detected: {default_device})")
     p.add_argument("--layers", type=str, default="last8", help="which blocks to prune: e.g., 'last8', '24-31', 'all', 'odd', 'list:0,2,5'")
-    p.add_argument("--prune-ratio", type=float, default=0.30, help="fraction of MLP hidden channels to remove in selected blocks")
-    p.add_argument("--calib-ds", type=str, default="imagenette", help="'imagenette' or a local folder for datasets.ImageFolder")
+    p.add_argument("--prune-ratio", type=float, nargs='+', default=[0.30], help="fraction(s) of MLP hidden channels to remove in selected blocks (can specify multiple: 0.90 0.92 0.95)")
+    p.add_argument("--calib-ds", type=str, default="imagenette", help="'imagenette' (auto-download) or a local folder path for datasets.ImageFolder")
     p.add_argument("--calib-samples", type=int, default=2000)
     p.add_argument("--batch-size", type=int, default=16)
     # NeuronRank hyperparameters (benchmark-style)
@@ -838,7 +1208,14 @@ def main():
     p.add_argument("--nr-idf-add", type=float, default=1.0, help="Constant added to IDF before exponentiation")
     p.add_argument("--nr-idf-smooth", type=float, default=1.0, help="Smoothing for IDF numerator/denominator")
     p.add_argument("--nr-weight-power", type=float, default=1.0, help="Exponent for weight magnitude component")
-    p.add_argument("--use-benchmark-nr", action="store_true", help="Use benchmark-style NeuronRank (pre-activation TF-IDF) instead of quantile DF")
+    p.add_argument("--use-benchmark-nr", action="store_true", help="[DEPRECATED] Use benchmark-style NeuronRank (pre-activation TF-IDF)")
+    p.add_argument("--use-postact-tfidf", action="store_true", help="Use post-activation TF-IDF NeuronRank (measures output neurons directly, recommended)")
+    p.add_argument("--nr-use-per-class", dest="nr_use_per_class", action="store_true", help="Use per-class TF-IDF discrimination when post-activation stats include class labels")
+    p.add_argument("--no-nr-use-per-class", dest="nr_use_per_class", action="store_false", help="Disable per-class TF-IDF discrimination (fallback to global stats only)")
+    p.set_defaults(nr_use_per_class=True)
+    p.add_argument("--nr-per-class-agg", type=str, default="var", choices=["max", "mean", "sum", "var", "std", "median", "max_minus_mean"], help="Aggregation over per-class TF-IDF scores")
+    p.add_argument("--nr-per-class-power", type=float, default=1.0, help="Exponent applied to aggregated per-class discrimination score")
+    p.add_argument("--nr-discrimination-weight", type=float, default=1.0, help="Weight for discrimination term in hybrid score: Score = (Variance^weight) * Magnitude")
     
     # Activation stats caching
     p.add_argument("--stats-cache-dir", type=str, default="./activation_stats_cache", help="Directory to cache activation statistics")
@@ -867,6 +1244,9 @@ def main():
     p.add_argument("--include-attn", action="store_true", help="Include attention (q/k/v and attn out) in unstructured pruning")
     p.add_argument("--no-mlp", action="store_true", help="Exclude MLP (fc1/fc2) from unstructured pruning")
     p.add_argument("--remove-reparam", action="store_true", help="Call prune.remove() to make zeros permanent on weights")
+    # Save control
+    p.add_argument("--save-models", action="store_true", help="Save pruned models to disk (disabled by default to save space)")
+    p.add_argument("--save-graph", action="store_true", help="Save comparison graph to disk (disabled by default)")
 
     args = p.parse_args()
     
@@ -875,6 +1255,10 @@ def main():
     print(f"Device: {args.device}")
     print(f"Model seed: {args.seed}")
     print(f"Eval seed: {args.eval_seed}")
+    if not args.save_models:
+        print("⚠️  Model saving DISABLED (use --save-models to enable)")
+    if not args.save_graph:
+        print("⚠️  Graph saving DISABLED (use --save-graph to enable)")
     print("="*80)
     
     seed_all(args.seed)
@@ -885,7 +1269,8 @@ def main():
         processor = AutoProcessor.from_pretrained(args.model_id, use_fast=args.use_fast_processor)
     except TypeError:
         # Older transformers may not accept use_fast for this processor; fall back silently
-        processor = AutoProcessor.from_pretrained(args.model_id)
+        print("[warn] `use_fast=True` failed for this processor, falling back.")
+    processor = AutoProcessor.from_pretrained(args.model_id)
     model = AutoModel.from_pretrained(args.model_id)
 
     # Discover all MLPs and choose targets
@@ -922,7 +1307,7 @@ def main():
         else:
             print(f"Running baseline k-NN (local ImageFolder at {eval_root})…")
             acc_base = knn_probe_local(model, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=eval_seeds[0])
-            print(f"Baseline k-NN@20: top-1 = {acc_base*100:.2f}%\n")
+        print(f"Baseline k-NN@20: top-1 = {acc_base*100:.2f}%\n")
 
     # === Unstructured path ===
     if args.mode == "unstructured":
@@ -990,9 +1375,9 @@ def main():
                 idf_smooth=args.nr_idf_smooth,
                 weight_power=args.nr_weight_power,
             )
-            zeros, tot = apply_unstructured_from_scores(score_map, amount=args.prune_ratio, scope=args.unstructured_scope, remove_reparam=args.remove_reparam)
+            zeros, tot = apply_unstructured_from_scores(score_map, amount=args.prune_ratio[0], scope=args.unstructured_scope, remove_reparam=args.remove_reparam)
             spars = 100.0 * zeros / max(1, tot)
-            print(f"[Unstructured-NRP] Applied {args.prune_ratio:.2f} ({args.unstructured_scope}) → sparsity {spars:.2f}% over fc1 weights")
+            print(f"[Unstructured-NRP] Applied {args.prune_ratio[0]:.2f} ({args.unstructured_scope}) → sparsity {spars:.2f}% over fc1 weights")
             if args.eval != "none":
                 if args.calib_ds == "imagenette":
                     eval_root = auto_download_imagenette()
@@ -1001,10 +1386,11 @@ def main():
                 acc_un_nrp = knn_probe_local(model_nrp, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
                 print(f"[Unstructured-NRP] k-NN@20: top-1 = {acc_un_nrp*100:.2f}%  |  Δ vs base = {(acc_un_nrp - (acc_base or acc_un_nrp)) * 100:.2f}%")
             # Save
-            out_dir_nrp = args.save_dir.rstrip("/") + "_unstr_nrp"
-            os.makedirs(out_dir_nrp, exist_ok=True)
-            print(f"Saving unstructured-NRP model to: {out_dir_nrp}")
-            model_nrp.save_pretrained(out_dir_nrp)
+            if args.save_models:
+                out_dir_nrp = args.save_dir.rstrip("/") + "_unstr_nrp"
+                os.makedirs(out_dir_nrp, exist_ok=True)
+                print(f"Saving unstructured-NRP model to: {out_dir_nrp}")
+                model_nrp.save_pretrained(out_dir_nrp)
 
         # ---- Magnitude variant ----
         if args.unstructured_method in ("mb", "both"):
@@ -1013,9 +1399,9 @@ def main():
             # Collect fc1 modules on the copied model
             fc1_list_mb = collect_fc1_modules_for_blocks(model_mb, target_indices)
             mods_mb = [m for _, m in fc1_list_mb]
-            zeros_mb, tot_mb = apply_unstructured_pruning(mods_mb, amount=args.prune_ratio, scope=args.unstructured_scope, remove_reparam=args.remove_reparam)
+            zeros_mb, tot_mb = apply_unstructured_pruning(mods_mb, amount=args.prune_ratio[0], scope=args.unstructured_scope, remove_reparam=args.remove_reparam)
             spars_mb = 100.0 * zeros_mb / max(1, tot_mb)
-            print(f"[Unstructured-MB] Applied {args.prune_ratio:.2f} ({args.unstructured_scope}) → sparsity {spars_mb:.2f}% over fc1 weights")
+            print(f"[Unstructured-MB] Applied {args.prune_ratio[0]:.2f} ({args.unstructured_scope}) → sparsity {spars_mb:.2f}% over fc1 weights")
             if args.eval != "none":
                 if args.calib_ds == "imagenette":
                     eval_root = auto_download_imagenette()
@@ -1024,10 +1410,11 @@ def main():
                 acc_un_mb = knn_probe_local(model_mb, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
                 print(f"[Unstructured-MB]  k-NN@20: top-1 = {acc_un_mb*100:.2f}%  |  Δ vs base = {(acc_un_mb - (acc_base or acc_un_mb)) * 100:.2f}%")
             # Save
-            out_dir_mb = args.save_dir.rstrip("/") + "_unstr_mb"
-            os.makedirs(out_dir_mb, exist_ok=True)
-            print(f"Saving unstructured-MB model to: {out_dir_mb}")
-            model_mb.save_pretrained(out_dir_mb)
+            if args.save_models:
+                out_dir_mb = args.save_dir.rstrip("/") + "_unstr_mb"
+                os.makedirs(out_dir_mb, exist_ok=True)
+                print(f"Saving unstructured-MB model to: {out_dir_mb}")
+                model_mb.save_pretrained(out_dir_mb)
 
         # ---- Summary ----
         if args.eval != "none":
@@ -1039,7 +1426,49 @@ def main():
         return
 
     # Calibrate NeuronRank scores
-    if args.use_benchmark_nr:
+    if args.use_postact_tfidf:
+        # Post-activation TF-IDF (NEW: measures output neurons directly)
+        print("Collecting NeuronRank scores (Variance x Magnitude method)...")
+        import hashlib
+        cache_key_str = f"postact_var_mag_{args.model_id}_{args.layers}_{args.calib_ds}_{args.calib_samples}"
+        cache_key = hashlib.md5(cache_key_str.encode()).hexdigest()
+        cache_dir = os.path.expanduser(args.stats_cache_dir)
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, f"activation_stats_{cache_key}.pt")
+        
+        activation_stats = None
+        if not args.force_recollect_stats and os.path.exists(cache_file):
+            try:
+                print(f"Loading cached activation statistics from: {cache_file}")
+                activation_stats = torch.load(cache_file, map_location='cpu')
+                print(f"✓ Loaded cached stats (post-activation, threshold={args.nr_activation_threshold})")
+            except Exception as e:
+                print(f"Warning: Failed to load cache ({e}), re-collecting...")
+                activation_stats = None
+        
+        if activation_stats is None:
+            activation_stats = collect_postactivation_stats(
+                model=model,
+                processor=processor,
+                dataset_name=args.calib_ds,
+                num_images=args.calib_samples,
+                target_mlps=target_mlps,
+                batch_size=args.batch_size,
+                device=args.device,
+            )
+            try:
+                torch.save(activation_stats, cache_file)
+                print(f"✓ Saved activation statistics to cache: {cache_file}")
+            except Exception as e:
+                print(f"Warning: Failed to save cache ({e})")
+        
+        print(f"  Computing scores based on (Variance^{args.nr_discrimination_weight} * Weight_Magnitude)...")
+        scores = compute_variance_magnitude_scores(
+            target_mlps=target_mlps,
+            activation_stats=activation_stats,
+            discrimination_weight=args.nr_discrimination_weight,
+        )
+    elif args.use_benchmark_nr:
         # Build cache key based on model, layers, dataset, samples, and activation threshold
         import hashlib
         cache_key_str = f"{args.model_id}_{args.layers}_{args.calib_ds}_{args.calib_samples}_{args.nr_activation_threshold}"
@@ -1101,65 +1530,97 @@ def main():
             device=args.device,
         )
 
-    # Apply structured pruning (NRP)
-    print(f"Applying structured pruning (NRP): ratio={args.prune_ratio:.2f} on {len(target_mlps)} blocks…")
-    pruned = apply_structured_mlp_pruning(
-        model=model,
-        processor=processor,
-        target_mlps=target_mlps,
-        scores=scores,
-        prune_ratio=args.prune_ratio,
-        device=args.device,
-    )
-    new_params = count_params(model)
-    print(f"Pruned channels: ~{pruned} (aggregated across blocks)")
-    print(f"{''}\nParams (after NRP): {new_params/1e6:.2f}M  |  Δ = {(base_params - new_params)/1e6:.2f}M\n")
+    # Track results for comparison table
+    results_list = []  # (ratio, nrp_acc, mb_acc, nrp_target_params, mb_target_params)
+    base_target_params = count_target_mlp_params(target_mlps)
+    print(f"Target MLP params (before pruning): {base_target_params/1e6:.2f}M")
 
-    # Evaluate NRP
-    acc_nrp = None
-    if args.eval != "none":
-        if args.calib_ds == "imagenette":
-            eval_root = auto_download_imagenette()
-        else:
-            eval_root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
-        print(f"Evaluating NRP model with k-NN (local ImageFolder at {eval_root})…")
-        acc_nrp = knn_probe_local(model, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
-        print(f"NRP k-NN@20: top-1 = {acc_nrp*100:.2f}%  |  Δ vs base = {(acc_nrp - (acc_base or acc_nrp)) * 100:.2f}%\n")
-
-    # Optional magnitude-based comparison
-    if args.compare_mb:
-        print("\n=== Magnitude-based pruning comparison ===")
-        model_mb = AutoModel.from_pretrained(args.model_id)
-        mlps_mb = find_mlp_modules(model_mb)
-        target_mb = [m for m in mlps_mb if m.idx in target_indices]
-        mb_scores = compute_magnitude_scores(target_mb)
-        print(f"Applying structured pruning (MBP): ratio={args.prune_ratio:.2f} on {len(target_mb)} blocks…")
-        _ = apply_structured_mlp_pruning(
-            model=model_mb,
+    # Apply structured pruning (NRP) for each prune ratio
+    for prune_ratio in args.prune_ratio:
+        print(f"\n{'='*80}")
+        print(f"Pruning with ratio: {prune_ratio:.2f}")
+        print(f"{'='*80}")
+        
+        # Deep copy model for this ratio
+        model_pruned = copy.deepcopy(model)
+        mlps_pruned = find_mlp_modules(model_pruned)
+        target_mlps_pruned = [m for m in mlps_pruned if m.idx in target_indices]
+        
+        print(f"Applying structured pruning (NRP): ratio={prune_ratio:.2f} on {len(target_mlps_pruned)} blocks…")
+        pruned = apply_structured_mlp_pruning(
+            model=model_pruned,
             processor=processor,
-            target_mlps=target_mb,
-            scores=mb_scores,
-            prune_ratio=args.prune_ratio,
+            target_mlps=target_mlps_pruned,
+            scores=scores,
+            prune_ratio=prune_ratio,
             device=args.device,
         )
+        new_params = count_params(model_pruned)
+        print(f"Pruned channels: ~{pruned} (aggregated across blocks)")
+        print(f"{''}\nParams (after NRP): {new_params/1e6:.2f}M  |  Δ = {(base_params - new_params)/1e6:.2f}M\n")
+
+        # Evaluate NRP
+        acc_nrp = None
+        nrp_target_params = count_target_mlp_params(target_mlps_pruned)
         if args.eval != "none":
             if args.calib_ds == "imagenette":
                 eval_root = auto_download_imagenette()
             else:
                 eval_root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
-            acc_mb = knn_probe_local(model_mb, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
-            print(f"MBP k-NN@20: top-1 = {acc_mb*100:.2f}%  |  Δ vs base = {(acc_mb - (acc_base or acc_mb)) * 100:.2f}%")
-        # Save MBP too
-        mb_dir = args.save_dir.rstrip("/") + "_mbp"
-        os.makedirs(mb_dir, exist_ok=True)
-        print(f"Saving magnitude-pruned model to: {mb_dir}")
-        model_mb.save_pretrained(mb_dir)
+            print(f"Evaluating NRP model with k-NN (local ImageFolder at {eval_root})…")
+            acc_nrp = knn_probe_local(model_pruned, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
+            print(f"NRP k-NN@20: top-1 = {acc_nrp*100:.2f}%  |  Δ vs base = {(acc_nrp - (acc_base or acc_nrp)) * 100:.2f}%\n")
 
-    # Save NRP model
-    os.makedirs(args.save_dir, exist_ok=True)
-    print(f"\nSaving NRP-pruned model to: {args.save_dir}")
-    model.save_pretrained(args.save_dir)
-    processor.save_pretrained(args.save_dir)
+        # Optional magnitude-based comparison
+        acc_mb = None
+        mb_target_params = None
+        if args.compare_mb:
+            print("\n=== Magnitude-based pruning comparison ===")
+            model_mb = AutoModel.from_pretrained(args.model_id)
+            mlps_mb = find_mlp_modules(model_mb)
+            target_mb = [m for m in mlps_mb if m.idx in target_indices]
+            mb_scores = compute_magnitude_scores(target_mb)
+            print(f"Applying structured pruning (MBP): ratio={prune_ratio:.2f} on {len(target_mb)} blocks…")
+            _ = apply_structured_mlp_pruning(
+                model=model_mb,
+                processor=processor,
+                target_mlps=target_mb,
+                scores=mb_scores,
+                prune_ratio=prune_ratio,
+                device=args.device,
+            )
+            mb_target_params = count_target_mlp_params(target_mb)
+            if args.eval != "none":
+                if args.calib_ds == "imagenette":
+                    eval_root = auto_download_imagenette()
+                else:
+                    eval_root, _ = _resolve_imagefolder_root_and_split(args.calib_ds)
+                acc_mb = knn_probe_local(model_mb, processor, root=eval_root, train_n=args.eval_train, val_n=args.eval_val, device=args.device, eval_seed=args.eval_seed)
+                print(f"MBP k-NN@20: top-1 = {acc_mb*100:.2f}%  |  Δ vs base = {(acc_mb - (acc_base or acc_mb)) * 100:.2f}%")
+            # Save MBP too
+            if args.save_models:
+                mb_dir = f"{args.save_dir}_r{int(prune_ratio*100):02d}_mbp"
+                os.makedirs(mb_dir, exist_ok=True)
+                print(f"Saving magnitude-pruned model to: {mb_dir}")
+                model_mb.save_pretrained(mb_dir)
+
+        # Save NRP model with ratio in directory name
+        if args.save_models:
+            save_dir = f"{args.save_dir}_r{int(prune_ratio*100):02d}"
+            os.makedirs(save_dir, exist_ok=True)
+            print(f"\nSaving NRP-pruned model to: {save_dir}")
+            model_pruned.save_pretrained(save_dir)
+            processor.save_pretrained(save_dir)
+        
+        # Store results for comparison table
+        if args.eval != "none":
+            results_list.append((
+                prune_ratio,
+                acc_nrp,
+                acc_mb,
+                nrp_target_params,
+                mb_target_params
+            ))
 
     # Summary
     if args.eval != "none":
@@ -1169,7 +1630,133 @@ def main():
         if args.compare_mb and 'acc_mb' in locals():
             print(f"MBP  : {acc_mb*100:.2f}%  (Δ {((acc_mb - acc_base) if acc_base is not None else 0)*100:.2f}%)")
 
-    print("Done.")
+    # === Final Comparison Table ===
+    if len(results_list) > 0 and args.eval != "none":
+        print("\n" + "="*110)
+        print("FINAL COMPARISON: NeuronRank vs Magnitude-Based Pruning")
+        print("="*110)
+        
+        # Table header
+        print(f"\n{'Sparsity':<10} {'Method':<8} {'Params (M)':<12} {'Compression':<14} {'k-NN Acc':<12} {'Δ Acc':<12}")
+        print("-" * 110)
+        
+        # Baseline row
+        if acc_base is not None:
+            print(f"{'0%':<10} {'Base':<8} {base_target_params/1e6:>10.2f}   {'1.00x':>12}   {acc_base*100:>10.2f}%  {'-':>10}")
+            print("-" * 110)
+        
+        # Results rows
+        for ratio, nrp_acc, mb_acc, nrp_params, mb_params in results_list:
+            sparsity_pct = ratio * 100
+            
+            # NeuronRank row
+            if nrp_acc is not None and nrp_params is not None:
+                compression_nr = base_target_params / nrp_params if nrp_params > 0 else 0
+                delta_acc_nr = (nrp_acc - acc_base) * 100 if acc_base else 0
+                print(f"{f'{sparsity_pct:.0f}%':<10} {'NR':<8} {nrp_params/1e6:>10.2f}   {f'{compression_nr:.2f}x':>12}   {nrp_acc*100:>10.2f}%  {delta_acc_nr:>+9.2f}%")
+            
+            # Magnitude-based row
+            if args.compare_mb and mb_acc is not None and mb_params is not None:
+                compression_mb = base_target_params / mb_params if mb_params > 0 else 0
+                delta_acc_mb = (mb_acc - acc_base) * 100 if acc_base else 0
+                print(f"{'':<10} {'MB':<8} {mb_params/1e6:>10.2f}   {f'{compression_mb:.2f}x':>12}   {mb_acc*100:>10.2f}%  {delta_acc_mb:>+9.2f}%")
+                print("-" * 110)
+            else:
+                print("-" * 110)
+        
+        # Key insights
+        if args.compare_mb and len(results_list) > 0:
+            print("\nKEY INSIGHTS:")
+            # Find best NR performance
+            best_nr = max([(r[0], r[1]) for r in results_list if r[1] is not None], key=lambda x: x[1], default=(0, 0))
+            print(f"  • Best NR performance: {best_nr[0]*100:.0f}% sparsity → {best_nr[1]*100:.2f}% accuracy")
+            
+            # Average advantage
+            advantages = [(r[1] - r[2]) * 100 for r in results_list if r[1] is not None and r[2] is not None]
+            if advantages:
+                avg_adv = sum(advantages) / len(advantages)
+                print(f"  • Average NR advantage over MB: {avg_adv:+.2f}%")
+            
+            # Most aggressive pruning
+            if results_list:
+                most_aggressive = max(results_list, key=lambda x: x[0])
+                if most_aggressive[1] is not None and most_aggressive[3] is not None:
+                    comp_rate = base_target_params / most_aggressive[3]
+                    retention = (most_aggressive[1] / acc_base * 100) if acc_base else 0
+                    print(f"  • Most aggressive: {most_aggressive[0]*100:.0f}% sparsity → {comp_rate:.2f}x compression, {retention:.1f}% accuracy retention")
+        
+        print("="*110)
+        
+        # === Matplotlib Graph ===
+        if len(results_list) > 1 and HAS_MATPLOTLIB:
+            print("\nGenerating comparison graph...")
+            
+            # Prepare data
+            sparsities = [0] + [r[0] * 100 for r in results_list]
+            nr_accs = [acc_base * 100 if acc_base else 0] + [r[1] * 100 if r[1] else 0 for r in results_list]
+            
+            # Create figure
+            plt.figure(figsize=(10, 6))
+            
+            # Plot NeuronRank
+            plt.plot(sparsities, nr_accs, marker='o', linewidth=2.5, markersize=8, 
+                    label='NeuronRank', color='#2E86AB', linestyle='-')
+            
+            # Plot Magnitude-Based if available
+            if args.compare_mb:
+                mb_accs = [acc_base * 100 if acc_base else 0] + [r[2] * 100 if r[2] else 0 for r in results_list if r[2] is not None]
+                if len(mb_accs) == len(sparsities):
+                    plt.plot(sparsities, mb_accs, marker='s', linewidth=2.5, markersize=8,
+                            label='Magnitude-Based', color='#A23B72', linestyle='--')
+            
+            # Baseline horizontal line
+            if acc_base is not None:
+                plt.axhline(y=acc_base * 100, color='#06A77D', linestyle=':', linewidth=2, 
+                           label='Baseline', alpha=0.7)
+            
+            # Formatting
+            plt.xlabel('Sparsity (%)', fontsize=12, fontweight='bold')
+            plt.ylabel('k-NN Accuracy (%)', fontsize=12, fontweight='bold')
+            plt.title('Pruning Performance: Accuracy vs Sparsity', fontsize=14, fontweight='bold', pad=20)
+            plt.legend(loc='best', fontsize=11, framealpha=0.9)
+            plt.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+            
+            # Set reasonable axis limits
+            plt.xlim(-5, 105)
+            all_accs = nr_accs.copy()
+            if args.compare_mb and 'mb_accs' in locals():
+                all_accs.extend(mb_accs)
+            acc_min = min(all_accs) - 2
+            acc_max = max(all_accs) + 2
+            plt.ylim(acc_min, acc_max)
+            
+            # Add annotations for key points
+            # Best NR point
+            best_idx = nr_accs.index(max(nr_accs[1:], default=nr_accs[0]))
+            if best_idx > 0:
+                plt.annotate(f'{nr_accs[best_idx]:.1f}%', 
+                           xy=(sparsities[best_idx], nr_accs[best_idx]),
+                           xytext=(10, 10), textcoords='offset points',
+                           bbox=dict(boxstyle='round,pad=0.5', facecolor='yellow', alpha=0.7),
+                           fontsize=9)
+            
+            plt.tight_layout()
+            
+            # Save graph
+            if args.save_graph:
+                graph_path = os.path.join(args.save_dir, "pruning_comparison.png")
+                os.makedirs(os.path.dirname(graph_path) if os.path.dirname(graph_path) else '.', exist_ok=True)
+                plt.savefig(graph_path, dpi=300, bbox_inches='tight')
+                print(f"✓ Saved comparison graph: {graph_path}")
+                
+                # Also save as PDF for papers
+                pdf_path = graph_path.replace('.png', '.pdf')
+                plt.savefig(pdf_path, bbox_inches='tight')
+                print(f"✓ Saved comparison graph (PDF): {pdf_path}")
+            
+            plt.close()
+
+    print("\nDone.")
 
 
 # ------------------------------
